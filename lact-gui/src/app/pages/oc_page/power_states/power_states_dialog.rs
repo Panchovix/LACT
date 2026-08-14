@@ -73,6 +73,7 @@ impl relm4::Component for PowerStatesDialog {
             set_title: &match model.domain {
                 ClockDomain::Gpu => fl!(I18N, "gpu-pstates"),
                 ClockDomain::Vram => fl!(I18N, "vram-pstates"),
+                ClockDomain::Advanced => fl!(I18N, "advanced-section"),
             },
 
             #[wrap(Some)]

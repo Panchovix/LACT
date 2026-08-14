@@ -41,6 +41,7 @@ pub struct OcPage {
     gpu_clocks_frame: relm4::Controller<ClocksFrame>,
     vram_clocks_frame: relm4::Controller<ClocksFrame>,
     igpu_frame: relm4::Controller<IGpuFrame>,
+    advanced_clocks_frame: relm4::Controller<ClocksFrame>,
 
     vf_curve_editor: relm4::Controller<VfCurveEditor>,
 }
@@ -59,7 +60,7 @@ pub enum OcPageMsg {
         initial: bool,
     },
     ClocksTable {
-        table: Option<ClocksTable>,
+        table: Option<Box<ClocksTable>>,
         vf_curve_is_configured: bool,
     },
     ProfileModesTable(Option<PowerProfileModesTable>),
@@ -97,6 +98,7 @@ impl relm4::Component for OcPage {
                     ColumnBias::Right,   // VRAM
                     ColumnBias::Left,    // Power
                     ColumnBias::Right,   // Integrated Graphics
+                    ColumnBias::Left,    // Advanced
 
                 ])),
                 set_valign: gtk::Align::Start,
@@ -114,6 +116,10 @@ impl relm4::Component for OcPage {
                 },
 
                 model.igpu_frame.widget() {
+                    add_css_class: "oc-page-section",
+                },
+
+                model.advanced_clocks_frame.widget() {
                     add_css_class: "oc-page-section",
                 },
             },
@@ -156,6 +162,12 @@ impl relm4::Component for OcPage {
         .forward(sender.input_sender(), |msg| msg);
         let power_states_dialog =
             PowerStatesDialog::launch_default().forward(sender.input_sender(), |msg| msg);
+        let advanced_clocks_frame = ClocksFrame::launch(ClocksFrameInit {
+            domain: ClockDomain::Advanced,
+            vf_curve_editing: BoolBinding::new(false),
+            show_all_pstates: BoolBinding::new(false),
+        })
+        .forward(sender.input_sender(), |msg| msg);
         let power_frame = PowerFrame::launch_default().forward(sender.input_sender(), |msg| msg);
         let igpu_frame = IGpuFrame::launch_default().forward(sender.input_sender(), |msg| msg);
 
@@ -172,6 +184,7 @@ impl relm4::Component for OcPage {
             gpu_clocks_frame,
             vram_clocks_frame,
             igpu_frame,
+            advanced_clocks_frame,
             vf_curve_editor,
         };
 
@@ -230,13 +243,17 @@ impl relm4::Component for OcPage {
                 table,
                 vf_curve_is_configured,
             } => {
-                let table = table.map(Arc::new);
+                let table = table.map(Arc::<ClocksTable>::from);
 
                 self.gpu_clocks_frame.emit(ClocksFrameMsg::Clocks {
                     table: table.clone(),
                     vf_curve_is_configured,
                 });
                 self.vram_clocks_frame.emit(ClocksFrameMsg::Clocks {
+                    table: table.clone(),
+                    vf_curve_is_configured,
+                });
+                self.advanced_clocks_frame.emit(ClocksFrameMsg::Clocks {
                     table: table.clone(),
                     vf_curve_is_configured,
                 });
@@ -343,6 +360,7 @@ impl OcPage {
     ) -> config::ClocksConfiguration {
         let mut commands = self.gpu_clocks_frame.model().get_commands();
         commands.extend(self.vram_clocks_frame.model().get_commands());
+        commands.extend(self.advanced_clocks_frame.model().get_commands());
 
         debug!("applying clocks commands {commands:#?}");
 
