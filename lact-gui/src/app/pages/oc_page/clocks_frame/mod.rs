@@ -19,8 +19,8 @@ use lact_schema::{
     request::{ClockspeedType, SetClocksCommand},
 };
 use relm4::{
-    ComponentParts, ComponentSender, RelmObjectExt, WidgetTemplate, binding::BoolBinding, css,
-    factory::FactoryHashMap,
+    ComponentParts, ComponentSender, RelmObjectExt, RelmWidgetExt, WidgetTemplate,
+    binding::BoolBinding, css, factory::FactoryHashMap,
 };
 use std::{collections::HashSet, sync::Arc};
 
@@ -71,6 +71,8 @@ pub struct ClocksFrameInit {
 pub enum ClockDomain {
     Gpu,
     Vram,
+    /// Clock domains the driver does not expose through its normal interface.
+    Advanced,
 }
 
 impl ClockDomain {
@@ -90,6 +92,9 @@ impl ClockDomain {
             | ClockspeedType::MemClockOffset(_)
             | ClockspeedType::MemVfCurveClock(_)
             | ClockspeedType::MemVfCurveVoltage(_) => Self::Vram,
+            ClockspeedType::ClockDomainOffset(_) | ClockspeedType::ClockDomainVoltageOffset(_) => {
+                Self::Advanced
+            }
             ClockspeedType::Reset => unreachable!(),
         };
         self == domain
@@ -123,6 +128,7 @@ impl relm4::Component for ClocksFrame {
             set_name: match model.domain {
                 ClockDomain::Gpu => fl!(I18N, "core-section"),
                 ClockDomain::Vram => fl!(I18N, "vram-section"),
+                ClockDomain::Advanced => fl!(I18N, "advanced-section"),
             },
             #[watch]
             set_visible: model.domain == ClockDomain::Gpu
@@ -133,6 +139,24 @@ impl relm4::Component for ClocksFrame {
                 set_spacing: 10,
                 set_hexpand: true,
                 set_halign: gtk::Align::End,
+
+                append = &gtk::MenuButton {
+                    set_icon_name: "dialog-information-symbolic",
+                    set_always_show_arrow: false,
+                    add_css_class: "flat",
+                    set_valign: gtk::Align::Center,
+                    set_visible: model.domain == ClockDomain::Advanced,
+
+                    #[wrap(Some)]
+                    set_popover = &gtk::Popover {
+                        gtk::Label {
+                            set_margin_all: 5,
+                            set_label: &fl!(I18N, "advanced-section-description"),
+                            set_wrap: true,
+                            set_max_width_chars: 55,
+                        }
+                    },
+                },
 
                 append = &gtk::Button {
                     set_label: &fl!(I18N, "vf-curve-editor"),
@@ -409,6 +433,7 @@ impl relm4::Component for ClocksFrame {
                 (self.active_power_state, self.current_clock) = match self.domain {
                     ClockDomain::Gpu => (active_states.core, stats.clockspeed.gpu_clockspeed),
                     ClockDomain::Vram => (active_states.memory, stats.clockspeed.vram_clockspeed),
+                    ClockDomain::Advanced => (None, None),
                 };
             }
             ClocksFrameMsg::TogglePStatesVisibility => {
@@ -453,6 +478,7 @@ impl ClocksFrame {
                 let ratio = match self.domain {
                     ClockDomain::Gpu => 1.0,
                     ClockDomain::Vram => self.vram_clock_ratio,
+                    ClockDomain::Advanced => 1.0,
                 };
                 format!("{:.0} {}", clock as f64 * ratio, fl!(I18N, "mhz"))
             }
@@ -701,22 +727,26 @@ impl ClocksFrame {
         self.show_nvidia_options = true;
         self.vf_curve_available = !table.gpu_vf_curve.is_empty();
 
-        let (clock_range, locked_clocks, min_type, max_type) = match self.domain {
-            ClockDomain::Gpu => (
+        let locked = match self.domain {
+            ClockDomain::Gpu => Some((
                 table.gpu_clock_range,
                 table.gpu_locked_clocks,
                 ClockspeedType::MinCoreClock,
                 ClockspeedType::MaxCoreClock,
-            ),
-            ClockDomain::Vram => (
+            )),
+            ClockDomain::Vram => Some((
                 table.vram_clock_range,
                 table.vram_locked_clocks,
                 ClockspeedType::MinMemoryClock,
                 ClockspeedType::MaxMemoryClock,
-            ),
+            )),
+            // None of these is a core or VRAM clock, so there is no range to lock
+            ClockDomain::Advanced => None,
         };
 
-        if let Some((gpu_min, gpu_max)) = clock_range {
+        if let Some((clock_range, locked_clocks, min_type, max_type)) = locked
+            && let Some((gpu_min, gpu_max)) = clock_range
+        {
             let (current_min, current_max) = match locked_clocks {
                 Some(locked_range) => {
                     self.enable_locked_clocks.set_value(true);
@@ -746,6 +776,40 @@ impl ClocksFrame {
                 ClockspeedType::MemClockOffset(*pstate),
                 nvidia_clock_offset_to_data(offset, *pstate > 0),
             );
+        }
+
+        for domain_offset in &table.clock_domain_offsets {
+            self.set_clock(
+                ClockspeedType::ClockDomainOffset(domain_offset.domain),
+                ClocksData {
+                    current: domain_offset.freq.current,
+                    min: domain_offset.freq.min,
+                    max: domain_offset.freq.max,
+                    custom_title: Some(fl!(
+                        I18N,
+                        "clock-domain-offset",
+                        domain = domain_offset.name.clone()
+                    )),
+                    ..Default::default()
+                },
+            );
+
+            if let Some(voltage) = &domain_offset.voltage {
+                self.set_clock(
+                    ClockspeedType::ClockDomainVoltageOffset(domain_offset.domain),
+                    ClocksData {
+                        current: voltage.current,
+                        min: voltage.min,
+                        max: voltage.max,
+                        custom_title: Some(fl!(
+                            I18N,
+                            "clock-domain-voltage-offset",
+                            domain = domain_offset.name.clone()
+                        )),
+                        ..Default::default()
+                    },
+                );
+            }
         }
 
         if let Some(voltage_boost) = table.voltage_boost {
@@ -843,6 +907,13 @@ fn clock_title(clock_type: ClockspeedType) -> String {
         ClockspeedType::GpuVfCurveVoltage(pstate) | ClockspeedType::MemVfCurveVoltage(pstate) => {
             fl!(I18N, "pstate-clock-voltage", pstate = pstate)
         }
+        // These always carry a custom title with the domain name
+        ClockspeedType::ClockDomainOffset(domain) => {
+            fl!(I18N, "clock-domain-offset", domain = domain)
+        }
+        ClockspeedType::ClockDomainVoltageOffset(domain) => {
+            fl!(I18N, "clock-domain-voltage-offset", domain = domain)
+        }
         ClockspeedType::Reset => unreachable!(),
     }
 }
@@ -856,12 +927,14 @@ fn clock_unit(clock_type: ClockspeedType) -> String {
         | ClockspeedType::MinMemoryClock
         | ClockspeedType::MemClockOffset(_)
         | ClockspeedType::GpuVfCurveClock(_)
-        | ClockspeedType::MemVfCurveClock(_) => fl!(I18N, "mhz"),
+        | ClockspeedType::MemVfCurveClock(_)
+        | ClockspeedType::ClockDomainOffset(_) => fl!(I18N, "mhz"),
         ClockspeedType::MinVoltage
         | ClockspeedType::MaxVoltage
         | ClockspeedType::VoltageOffset
         | ClockspeedType::GpuVfCurveVoltage(_)
-        | ClockspeedType::MemVfCurveVoltage(_) => fl!(I18N, "mv"),
+        | ClockspeedType::MemVfCurveVoltage(_)
+        | ClockspeedType::ClockDomainVoltageOffset(_) => fl!(I18N, "mv"),
         ClockspeedType::VoltageBoost => "%".into(),
         ClockspeedType::Reset => unreachable!(),
     }
@@ -876,13 +949,15 @@ fn get_row_step(clock_type: ClockspeedType) -> f64 {
         | ClockspeedType::MinMemoryClock
         | ClockspeedType::MemClockOffset(_)
         | ClockspeedType::GpuVfCurveClock(_)
-        | ClockspeedType::MemVfCurveClock(_) => 5.0,
+        | ClockspeedType::MemVfCurveClock(_)
+        | ClockspeedType::ClockDomainOffset(_) => 5.0,
         ClockspeedType::MinVoltage
         | ClockspeedType::MaxVoltage
         | ClockspeedType::VoltageOffset
         | ClockspeedType::VoltageBoost
         | ClockspeedType::GpuVfCurveVoltage(_)
-        | ClockspeedType::MemVfCurveVoltage(_) => 1.0,
+        | ClockspeedType::MemVfCurveVoltage(_)
+        | ClockspeedType::ClockDomainVoltageOffset(_) => 1.0,
         ClockspeedType::Reset => unreachable!(),
     }
 }
