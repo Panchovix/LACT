@@ -512,6 +512,28 @@ pub struct NvidiaClocksTable {
     pub clock_domain_offsets: Vec<NvidiaClockDomainOffset>,
     #[serde(default)]
     pub gpc_xbar_ratio: Option<NvidiaClockRatio>,
+    /// Read-only V/F curves of the clock domains that keep their own, such as XBAR
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub domain_vf_curves: Vec<NvidiaDomainVfCurve>,
+}
+
+/// The V/F curve of a clock domain other than GPC.
+///
+/// Reported for information only: the driver exposes no way to check whether a
+/// write to one of these was adopted, so they are not editable.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct NvidiaDomainVfCurve {
+    pub domain: u32,
+    pub name: String,
+    /// The rail the voltages are of, which is not the one GPC's curve uses
+    pub rail: String,
+    pub points: Vec<NvidiaDomainVfPoint>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NvidiaDomainVfPoint {
+    pub voltage: u32,
+    pub freq: u32,
 }
 
 /// Ratio at which the GPC clock propagates to XBAR, as a percentage

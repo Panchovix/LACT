@@ -43,6 +43,7 @@ pub struct ClocksFrame {
     vram_clock_ratio: f64,
     show_nvidia_options: bool,
     vf_curve_available: bool,
+    msvdd_curve_available: bool,
     show_all_pstates: BoolBinding,
     vf_curve_editing: BoolBinding,
     enable_locked_clocks: BoolBinding,
@@ -184,6 +185,17 @@ impl relm4::Component for ClocksFrame {
                 },
 
                 append = &gtk::Button {
+                    set_label: &fl!(I18N, "msvdd-curve-editor"),
+
+                    #[watch]
+                    set_visible: model.show_nvidia_options && model.msvdd_curve_available,
+
+                    connect_clicked[sender] => move |_| {
+                        sender.output(OcPageMsg::ShowMsvddCurveEditor).unwrap();
+                    }
+                },
+
+                append = &gtk::Button {
                     set_label: &fl!(I18N, "reset-now-button"),
                     set_tooltip_text: Some(&fl!(I18N, "reset-oc-tooltip")),
 
@@ -312,6 +324,7 @@ impl relm4::Component for ClocksFrame {
             vram_clock_ratio: 1.0,
             show_nvidia_options: false,
             vf_curve_available: false,
+            msvdd_curve_available: false,
             show_all_pstates,
             vf_curve_editing,
             enable_locked_clocks: BoolBinding::new(false),
@@ -717,6 +730,7 @@ impl ClocksFrame {
     fn set_nvidia_table(&mut self, table: &NvidiaClocksTable) {
         self.show_nvidia_options = true;
         self.vf_curve_available = !table.gpu_vf_curve.is_empty();
+        self.msvdd_curve_available = !table.domain_vf_curves.is_empty();
 
         let locked = match self.domain {
             ClockDomain::Gpu => Some((
