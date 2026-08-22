@@ -475,6 +475,109 @@ impl DriverHandle {
         Ok(control)
     }
 
+    /// The per-domain V/F curves, in the order the domains are enumerated.
+    ///
+    /// Every domain that has a curve keeps its own bank of [`VF_POINTS_PER_BANK`]
+    /// points, and all of the banks share one flat index space with the points of
+    /// frequency-based domains interleaved between them. Nothing in either
+    /// response says which bank belongs to which domain, so the banks are matched
+    /// to domains by the order `CLK_DOMAINS` enumerates them, which was confirmed
+    /// on hardware by offsetting one domain at a time and seeing exactly one bank
+    /// move.
+    pub fn get_domain_vf_curves(&self) -> anyhow::Result<Vec<(u32, Vec<VfPoint>)>> {
+        let mut info = vec![0u8; VF_INFO_SIZE];
+        unsafe {
+            self.query_rm_control_sized(NV2080_CTRL_CMD_CLK_VF_POINTS_GET_INFO, &mut info)?;
+        }
+
+        let mut status = vec![0u8; VF_STATUS_SIZE];
+        status[VF_MASK_AT..VF_MASK_AT + VF_MASK_LEN]
+            .copy_from_slice(&info[VF_MASK_AT..VF_MASK_AT + VF_MASK_LEN]);
+        unsafe {
+            self.query_rm_control_sized(NV2080_CTRL_CMD_CLK_VF_POINTS_GET_STATUS, &mut status)?;
+        }
+
+        let point_count: usize = info[VF_MASK_AT..VF_MASK_AT + VF_MASK_LEN]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| u32::from_le_bytes(*word).count_ones() as usize)
+            .sum();
+
+        // Group the flat space: voltage-based points make up the banks, and a run
+        // of frequency-based points is a domain described without a curve.
+        let mut groups: Vec<Option<Vec<VfPoint>>> = Vec::new();
+        let mut bank: Vec<VfPoint> = Vec::new();
+        let mut frequency_run = false;
+
+        for index in 0..point_count {
+            let at = VF_INFO_BASE + index * VF_INFO_STRIDE;
+            if at + VF_INFO_STRIDE > info.len() {
+                break;
+            }
+            let voltage_based =
+                u32::from_le_bytes(info[at..at + 4].try_into().unwrap()) == VF_TYPE_VOLTAGE;
+
+            if !voltage_based {
+                // close any partial bank, then collapse the whole run into one group
+                if !bank.is_empty() {
+                    groups.push(Some(mem::take(&mut bank)));
+                }
+                if !frequency_run {
+                    groups.push(None);
+                    frequency_run = true;
+                }
+                continue;
+            }
+            frequency_run = false;
+
+            let at = VF_STATUS_BASE + index * VF_STATUS_STRIDE;
+            if at + VF_STATUS_STRIDE > status.len() {
+                break;
+            }
+            let read = |offset: usize| {
+                u32::from_le_bytes(status[at + offset..at + offset + 4].try_into().unwrap())
+            };
+            bank.push(VfPoint {
+                voltage_mv: read(VF_STATUS_VOLTAGE_AT) / 1000,
+                freq_mhz: read(VF_STATUS_FREQ_AT),
+            });
+
+            if bank.len() == VF_POINTS_PER_BANK {
+                groups.push(Some(mem::take(&mut bank)));
+            }
+        }
+        if !bank.is_empty() {
+            groups.push(Some(bank));
+        }
+
+        // Domains in enumeration order take the groups in the same order.
+        let mut info_params: ClkDomainsInfoParams = unsafe { mem::zeroed() };
+        unsafe {
+            self.query_rm_control(NV2080_CTRL_CMD_CLK_CLK_DOMAINS_GET_INFO, &mut info_params)?;
+        }
+
+        let mut curves = Vec::new();
+        let mut groups = groups.into_iter();
+        for index in 0..CLK_DOMAIN_COUNT {
+            if info_params.domain_mask & (1 << index) == 0 {
+                continue;
+            }
+            let entry = &info_params.domains[index];
+            if !entry.domain_bit.is_power_of_two() || entry.offset_range_mhz().is_none() {
+                continue;
+            }
+            let Some(group) = groups.next() else {
+                break;
+            };
+            if let Some(points) = group {
+                curves.push((entry.domain_bit.trailing_zeros(), points));
+            }
+        }
+
+        Ok(curves)
+    }
+
     fn get_fb_info(&self, stat_index: u32) -> anyhow::Result<u32> {
         let mut info_list = vec![NV2080_CTRL_FB_INFO {
             index: stat_index,
@@ -490,6 +593,26 @@ impl DriverHandle {
         }
 
         Ok(info_list[0].data)
+    }
+
+    /// Issues a control whose parameter block is a plain byte buffer.
+    unsafe fn query_rm_control_sized(&self, cmd: u32, params: &mut [u8]) -> anyhow::Result<()> {
+        let mut request = NVOS54_PARAMETERS {
+            hClient: self.client_handle,
+            hObject: self.subdevice_handle,
+            cmd,
+            flags: 0,
+            params: params.as_mut_ptr().cast(),
+            paramsSize: params.len().try_into().unwrap(),
+            status: 0,
+        };
+        unsafe {
+            rm_control_nvos54(self.nvidiactl_fd.as_raw_fd(), &raw mut request)?;
+        }
+        if request.status != 0 {
+            bail!("Nvidia request failed with status {:x}", request.status);
+        }
+        Ok(())
     }
 
     unsafe fn query_rm_control<T: Copy>(&self, cmd: u32, params: &mut T) -> anyhow::Result<()> {
@@ -522,6 +645,34 @@ impl DriverHandle {
         Ok(())
     }
 }
+
+/// Undocumented RM controls for the V/F point board object group.
+///
+/// `GET_INFO` describes every point and, in the twenty words at `+0x04`, the mask
+/// of which are populated. `GET_STATUS` returns the curves themselves, but only
+/// when that mask is copied into the request; without it the response comes back
+/// empty, the same way the clock domain control does.
+const NV2080_CTRL_CMD_CLK_VF_POINTS_GET_INFO: u32 = 0x2080_9021;
+const NV2080_CTRL_CMD_CLK_VF_POINTS_GET_STATUS: u32 = 0x2080_9022;
+
+const VF_INFO_SIZE: usize = 0x8208;
+const VF_STATUS_SIZE: usize = 0x9_8208;
+/// Offset and length of the point mask both requests share.
+const VF_MASK_AT: usize = 0x04;
+const VF_MASK_LEN: usize = 20 * 4;
+/// Info records are a type word followed by a value, and start one word into the
+/// block rather than at its head.
+const VF_INFO_BASE: usize = 0x104;
+const VF_INFO_STRIDE: usize = 8;
+/// A point whose value is a voltage, rather than a frequency.
+const VF_TYPE_VOLTAGE: u32 = 0xffff_1111;
+/// Status records carry the whole point; only the tuple is read here.
+const VF_STATUS_BASE: usize = 0x100;
+const VF_STATUS_STRIDE: usize = 0x98;
+const VF_STATUS_VOLTAGE_AT: usize = 0x08;
+const VF_STATUS_FREQ_AT: usize = 0x0c;
+/// Points per domain within the flat index space.
+const VF_POINTS_PER_BANK: usize = 127;
 
 /// Undocumented RM controls for the clock domain board object group.
 ///
@@ -561,7 +712,7 @@ const RATIO_FRACTION_BITS: u32 = 16;
 /// The control request starts with this many bytes copied from the info response.
 const CLK_PROP_RELS_HEADER_LEN: usize = 0x24;
 
-/// NvAPI clock domain ids of the two ends of the ratio this exposes.
+/// `NvAPI` clock domain ids of the two ends of the ratio this exposes.
 const NV_CLK_DOMAIN_GPC: u32 = 0;
 const NV_CLK_DOMAIN_XBAR: u32 = 1;
 
@@ -583,7 +734,7 @@ const FREQ_OFFSET_MODE_KHZ: u8 = 0;
 /// Offsets currently applied to one adjustable clock domain.
 #[derive(Debug, Clone, Copy)]
 pub struct ClockDomainState {
-    /// NvAPI clock domain id, matching [`NvGpuClockDomainId`](super::nvapi::NvGpuClockDomainId).
+    /// `NvAPI` clock domain id, matching [`NvGpuClockDomainId`](super::nvapi::NvGpuClockDomainId).
     pub domain: u32,
     pub freq_offset_khz: i32,
     pub msvdd_offset_uv: i32,
@@ -605,6 +756,13 @@ pub struct ClockDomainOffset {
     pub domain: u32,
     pub freq_offset_khz: i32,
     pub msvdd_offset_uv: i32,
+}
+
+/// One point of a clock domain's V/F curve.
+#[derive(Debug, Clone, Copy)]
+pub struct VfPoint {
+    pub voltage_mv: u32,
+    pub freq_mhz: u32,
 }
 
 #[repr(C)]
@@ -639,7 +797,7 @@ const RANGE_OFFSET_3X: usize = 0x22;
 struct ClkDomainInfo {
     obj_type: u8,
     _obj_reserved: [u8; 3],
-    /// `1 << domain id`, where the id matches the NvAPI clock domain enum.
+    /// `1 << domain id`, where the id matches the `NvAPI` clock domain enum.
     domain_bit: u32,
     /// Read positionally, because the field layout moves with `obj_type`.
     tail: [u8; 0x178],
@@ -818,3 +976,115 @@ ioctl_readwrite!(
     DRM_COMMAND_BASE + DRM_NVIDIA_GET_DPY_ID_FOR_CONNECTOR_ID,
     drm_nvidia_get_dpy_id_for_connector_id_params
 );
+
+#[cfg(test)]
+mod hardware_tests {
+    use super::*;
+
+    /// Probe only: identifies each V/F bank by offsetting one domain at a time.
+    #[test]
+    #[ignore]
+    fn probe_identify_vf_banks() {
+        let Ok(minor) = std::env::var("LACT_TEST_GPU_MINOR") else {
+            println!("LACT_TEST_GPU_MINOR is not set, skipping");
+            return;
+        };
+        let pci = std::env::var("LACT_TEST_GPU_PCI")
+            .expect("LACT_TEST_GPU_PCI must identify the GPU whose minor was selected");
+        let [domain, bus, dev, func]: [u16; 4] = pci
+            .split([':', '.'])
+            .map(|part| u16::from_str_radix(part, 16).unwrap())
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap();
+        let pci_slot = PciSlotInfo {
+            domain,
+            bus,
+            dev,
+            func,
+        };
+        let handle = DriverHandle::open(minor.parse().unwrap(), &pci_slot).unwrap();
+
+        const BANKS: [usize; 5] = [0, 127, 259, 386, 513];
+        const SAMPLE: usize = 63; // mid curve, away from the clamped ends
+
+        let read_banks = |handle: &DriverHandle| -> Vec<u32> {
+            let mut info = vec![0u8; 0x8208];
+            let mut req = NVOS54_PARAMETERS {
+                hClient: handle.client_handle,
+                hObject: handle.subdevice_handle,
+                cmd: 0x2080_9021,
+                flags: 0,
+                params: info.as_mut_ptr().cast(),
+                paramsSize: info.len().try_into().unwrap(),
+                status: 0,
+            };
+            unsafe { rm_control_nvos54(handle.nvidiactl_fd.as_raw_fd(), &raw mut req).unwrap() };
+            assert_eq!(req.status, 0);
+
+            let mut status = vec![0u8; 0x98208];
+            status[0..4].copy_from_slice(&255u32.to_le_bytes());
+            status[4..84].copy_from_slice(&info[4..84]);
+            let mut req = NVOS54_PARAMETERS {
+                hClient: handle.client_handle,
+                hObject: handle.subdevice_handle,
+                cmd: 0x2080_9022,
+                flags: 0,
+                params: status.as_mut_ptr().cast(),
+                paramsSize: status.len().try_into().unwrap(),
+                status: 0,
+            };
+            unsafe { rm_control_nvos54(handle.nvidiactl_fd.as_raw_fd(), &raw mut req).unwrap() };
+            assert_eq!(req.status, 0);
+
+            BANKS
+                .iter()
+                .map(|start| {
+                    let at = 0x100 + (start + SAMPLE) * 0x98;
+                    u32::from_le_bytes(status[at + 0x0c..at + 0x10].try_into().unwrap())
+                })
+                .collect()
+        };
+
+        let set = |handle: &DriverHandle, domain: u32, mhz: i32| {
+            handle
+                .set_clock_domain_offsets(&[ClockDomainOffset {
+                    domain,
+                    freq_offset_khz: mhz * 1000,
+                    msvdd_offset_uv: 0,
+                }])
+                .unwrap();
+        };
+
+        let base = read_banks(&handle);
+        println!("línea base (punto {SAMPLE} de cada banco): {base:?}");
+
+        for (domain, mhz) in [(0u32, 50i32), (4, 200), (1, 200), (2, 200), (20, 200)] {
+            set(&handle, domain, mhz);
+            let moved = read_banks(&handle);
+            set(&handle, domain, 0);
+            let restored = read_banks(&handle);
+
+            let deltas: Vec<i64> = moved
+                .iter()
+                .zip(&base)
+                .map(|(m, b)| i64::from(*m) - i64::from(*b))
+                .collect();
+            let which: Vec<String> = deltas
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| **d != 0)
+                .map(|(i, d)| format!("banco {i} ({d:+})"))
+                .collect();
+            println!(
+                "dominio {domain:2} +{mhz}MHz -> {}   restaurado_ok={}",
+                if which.is_empty() {
+                    "ningún banco se movió".into()
+                } else {
+                    which.join(", ")
+                },
+                restored == base
+            );
+        }
+    }
+}
