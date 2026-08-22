@@ -1,6 +1,7 @@
 mod card_layout;
 mod clocks_frame;
 mod igpu_frame;
+mod msvdd_curve;
 mod power_frame;
 mod power_profile_mode;
 mod power_states;
@@ -23,6 +24,7 @@ use clocks_frame::{ClockDomain, ClocksFrame, ClocksFrameInit, ClocksFrameMsg};
 use indexmap::IndexMap;
 use lact_schema::config;
 use lact_schema::{ClocksTable, DeviceInfo, PowerStates};
+use msvdd_curve::{MsvddCurveEditor, MsvddCurveEditorMsg};
 use power_frame::{PowerFrame, PowerFrameMsg, PowerFrameSerialized};
 use power_states::power_states_dialog::{PowerStatesDialog, PowerStatesDialogMsg};
 use relm4::binding::BoolBinding;
@@ -44,6 +46,7 @@ pub struct OcPage {
     advanced_clocks_frame: relm4::Controller<ClocksFrame>,
 
     vf_curve_editor: relm4::Controller<VfCurveEditor>,
+    msvdd_curve_editor: relm4::Controller<MsvddCurveEditor>,
 }
 
 pub struct OcPageSerialized {
@@ -74,6 +77,7 @@ pub enum OcPageMsg {
     ShowPowerStates(ClockDomain),
     ShowVfCurveEditor,
     VfCurveEditingToggled(bool),
+    ShowMsvddCurveEditor,
 }
 
 #[relm4::component(pub)]
@@ -175,6 +179,7 @@ impl relm4::Component for OcPage {
             global_settings_changed: settings_changed,
             allow_editing: vf_curve_editing,
         });
+        let msvdd_curve_editor = MsvddCurveEditor::detach(());
 
         let model = Self {
             stats_section,
@@ -186,6 +191,7 @@ impl relm4::Component for OcPage {
             igpu_frame,
             advanced_clocks_frame,
             vf_curve_editor,
+            msvdd_curve_editor,
         };
 
         let widgets = view_output!();
@@ -259,6 +265,8 @@ impl relm4::Component for OcPage {
                 });
                 self.vf_curve_editor
                     .emit(VfCurveEditorMsg::Clocks(table.clone()));
+                self.msvdd_curve_editor
+                    .emit(MsvddCurveEditorMsg::Clocks(table.clone()));
             }
             OcPageMsg::ProfileModesTable(modes_table) => {
                 self.power_frame
@@ -322,6 +330,9 @@ impl relm4::Component for OcPage {
                 } else {
                     self.vf_curve_editor.emit(VfCurveEditorMsg::ResetCurve);
                 }
+            }
+            OcPageMsg::ShowMsvddCurveEditor => {
+                self.msvdd_curve_editor.emit(MsvddCurveEditorMsg::Show);
             }
         }
 

@@ -25,9 +25,9 @@ use lact_schema::{
     ActivePowerStates, CacheInfo, ClocksInfo, ClocksTable, ClockspeedStats, DeviceApiInfo,
     DeviceFlag, DeviceInfo, DeviceStats, DeviceType, DrmInfo, DrmMemoryInfo, FanControlMode,
     FanStats, IntelDrmInfo, LinkInfo, NvidiaClockDomainOffset, NvidiaClockOffset, NvidiaClockRatio,
-    NvidiaClocksTable, NvidiaThermalInfo, NvidiaVfPoint, NvidiaVoltageBoost, PmfwInfo, PowerState,
-    PowerStates, PowerStats, ProcessInfo, ProcessList, ProcessType, ProcessUtilizationType,
-    TemperatureEntry, VoltageStats, VramStats,
+    NvidiaClocksTable, NvidiaDomainVfCurve, NvidiaDomainVfPoint, NvidiaThermalInfo, NvidiaVfPoint,
+    NvidiaVoltageBoost, PmfwInfo, PowerState, PowerStates, PowerStats, ProcessInfo, ProcessList,
+    ProcessType, ProcessUtilizationType, TemperatureEntry, VoltageStats, VramStats,
     config::{FanControlSettings, FanCurve, GpuConfig, NvidiaCurvePoint},
 };
 use nvapi::NvApi;
@@ -578,6 +578,44 @@ impl NvidiaGpuController {
                         min: -MAX_MSVDD_OFFSET_MV,
                         max: MAX_MSVDD_OFFSET_MV,
                     }),
+                })
+            })
+            .collect()
+    }
+
+    /// The V/F curve of every clock domain that keeps one, for display only.
+    fn get_domain_vf_curves(&self) -> Vec<NvidiaDomainVfCurve> {
+        let Some(handle) = &self.driver_handle else {
+            return Vec::new();
+        };
+
+        let curves = match handle.get_domain_vf_curves() {
+            Ok(curves) => curves,
+            Err(err) => {
+                debug!("could not read domain V/F curves: {err:#}");
+                return Vec::new();
+            }
+        };
+
+        curves
+            .into_iter()
+            .filter_map(|(domain, points)| {
+                // GPC already has its own editor, and unnamed domains are ones we
+                // deliberately do not surface.
+                let name = NvGpuClockDomainId::from_id(domain)?.to_string();
+                Some(NvidiaDomainVfCurve {
+                    domain,
+                    name,
+                    // These are the domains whose offsets go to the MSVDD slot, so
+                    // their curves are of that rail rather than the one GPC uses.
+                    rail: "MSVDD".to_owned(),
+                    points: points
+                        .into_iter()
+                        .map(|point| NvidiaDomainVfPoint {
+                            voltage: point.voltage_mv,
+                            freq: point.freq_mhz,
+                        })
+                        .collect(),
                 })
             })
             .collect()
@@ -1394,6 +1432,7 @@ impl GpuController for NvidiaGpuController {
             voltage_boost,
             clock_domain_offsets: self.get_clock_domain_offsets(),
             gpc_xbar_ratio: self.get_xbar_ratio(),
+            domain_vf_curves: self.get_domain_vf_curves(),
         };
 
         Ok(ClocksInfo {
