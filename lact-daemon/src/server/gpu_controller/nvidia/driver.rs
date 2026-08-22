@@ -418,7 +418,7 @@ const FREQ_OFFSET_MODE_KHZ: u8 = 0;
 /// Offsets currently applied to one adjustable clock domain.
 #[derive(Debug, Clone, Copy)]
 pub struct ClockDomainState {
-    /// NvAPI clock domain id, matching [`NvGpuClockDomainId`](super::nvapi::NvGpuClockDomainId).
+    /// `NvAPI` clock domain id, matching [`NvGpuClockDomainId`](super::nvapi::NvGpuClockDomainId).
     pub domain: u32,
     pub freq_offset_khz: i32,
     pub msvdd_offset_uv: i32,
@@ -466,7 +466,7 @@ const RANGE_OFFSET_3X: usize = 0x22;
 struct ClkDomainInfo {
     obj_type: u8,
     _obj_reserved: [u8; 3],
-    /// `1 << domain id`, where the id matches the NvAPI clock domain enum.
+    /// `1 << domain id`, where the id matches the `NvAPI` clock domain enum.
     domain_bit: u32,
     /// Read positionally, because the field layout moves with `obj_type`.
     tail: [u8; 0x178],
