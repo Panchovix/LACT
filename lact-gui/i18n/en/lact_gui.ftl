@@ -362,3 +362,6 @@ color-scheme-dark = Dark
 # Crash page
 crash-page-title = Application Crashed
 exit = Exit
+msvdd-voltage = MSVDD Voltage
+msvdd-curve-editor = MSVDD VF Curve
+msvdd-curve-description = Voltage-frequency curves of the clock domains fed by the MSVDD rail. Shown for reference only: the driver reports no way to tell whether a change to one of these was adopted.
