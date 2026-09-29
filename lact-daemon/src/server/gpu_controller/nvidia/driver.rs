@@ -46,6 +46,8 @@ use anyhow::{Context, bail, ensure};
 use lact_schema::RopInfo;
 use nix::ioctl_readwrite;
 
+pub mod power_limit;
+
 pub struct DriverHandle {
     nvidiactl_fd: OwnedFd,
     #[allow(dead_code)]
