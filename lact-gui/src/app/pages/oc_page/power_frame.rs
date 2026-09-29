@@ -5,8 +5,8 @@ use crate::{
             adjustment_card::AdjustmentCard,
             page_section::PageSection,
             setting_row::{
-                AdjustmentInit, SelectInit, SelectOption, SettingRow, SettingRowInit,
-                SettingRowMsg, SettingRowValue,
+                AdjustmentControlMsg, AdjustmentInit, SelectInit, SelectOption, SettingControl,
+                SettingRow, SettingRowInit, SettingRowMsg, SettingRowValue,
             },
         },
         msg::AppMsg,
@@ -19,7 +19,7 @@ use crate::{
 use adw::prelude::*;
 use amdgpu_sysfs::gpu_handle::{PerformanceLevel, power_profile_mode::PowerProfileModesTable};
 use i18n_embed_fl::fl;
-use lact_schema::DeviceStats;
+use lact_schema::{DeviceStats, PowerStats, config::NvidiaPowerCapMode};
 use nvml_wrapper::enums::device::PowerMizerMode;
 use relm4::{
     ComponentController, ComponentParts, ComponentSender, Controller, WidgetTemplate,
@@ -47,6 +47,7 @@ pub enum PowerSetting {
 
 pub struct PowerFrameSerialized {
     pub power_cap: Option<f64>,
+    pub nvidia_power_cap_mode: Option<NvidiaPowerCapMode>,
     pub performance_level: Option<PerformanceLevel>,
     pub power_mizer_mode: Option<PowerMizerMode>,
     pub power_profile_mode_index: Option<u16>,
@@ -54,6 +55,8 @@ pub struct PowerFrameSerialized {
 }
 
 pub struct PowerFrame {
+    power: PowerStats,
+    nvidia_mode: Option<NvidiaPowerCapMode>,
     rows: FactoryHashMap<PowerSetting, SettingRow<PowerSetting>>,
     supported_power_mizer_modes: Vec<PowerMizerMode>,
     power_profile_mode: Option<Controller<AmdPowerProfileMode>>,
@@ -62,6 +65,9 @@ pub struct PowerFrame {
 #[derive(Debug)]
 pub enum PowerFrameMsg {
     Stats(Arc<DeviceStats>),
+    /// `None` unless the GPU uses the NVIDIA driver.
+    NvidiaMode(Option<NvidiaPowerCapMode>),
+    ToggleNvidiaIoctl(bool),
     SetPerformanceLevel(PerformanceLevel),
     PowerProfileModes(Option<PowerProfileModesTable>),
     SettingChanged(PowerSetting),
@@ -91,7 +97,43 @@ impl relm4::Component for PowerFrame {
                 #[watch]
                 set_visible: !model.rows.is_empty(),
             },
-            append_child = model.rows.widget(),
+            #[template]
+            #[local]
+            append_child = &card -> AdjustmentCard {
+                #[template_child]
+                content {
+                    #[name = "experimental_controls"]
+                    gtk::ListBoxRow {
+                        set_activatable: false,
+                        set_selectable: false,
+                        #[watch]
+                        set_visible: model.nvidia_mode_available(),
+
+                        gtk::Box {
+                            set_orientation: gtk::Orientation::Vertical,
+                            set_spacing: 6,
+
+                            #[name = "ioctl_toggle"]
+                            gtk::CheckButton {
+                                set_label: Some(&fl!(I18N, "nvidia-power-cap-ioctl")),
+                                #[watch]
+                                #[block_signal(ioctl_toggled_handler)]
+                                set_active: model.nvidia_mode == Some(NvidiaPowerCapMode::Ioctl),
+                                connect_toggled[sender] => move |button| {
+                                    sender.input(PowerFrameMsg::ToggleNvidiaIoctl(button.is_active()));
+                                } @ ioctl_toggled_handler,
+                            },
+                            gtk::Label {
+                                set_label: &fl!(I18N, "nvidia-power-cap-ioctl-warning"),
+                                set_wrap: true,
+                                set_max_width_chars: 55,
+                                set_xalign: 0.0,
+                                add_css_class: relm4::css::WARNING,
+                            },
+                        },
+                    },
+                },
+            },
         },
     }
 
@@ -100,9 +142,12 @@ impl relm4::Component for PowerFrame {
         root: Self::Root,
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
+        let card = AdjustmentCard::init(());
         let model = Self {
+            power: PowerStats::default(),
+            nvidia_mode: None,
             rows: FactoryHashMap::builder()
-                .launch(AdjustmentCard::init(()).content.clone())
+                .launch(card.content.clone())
                 .forward(sender.input_sender(), |(setting, _)| {
                     PowerFrameMsg::SettingChanged(setting)
                 }),
@@ -111,11 +156,21 @@ impl relm4::Component for PowerFrame {
         };
         let widgets = view_output!();
 
-        model.rows.widget().set_sort_func(|left, right| {
-            // Keep the power profile mode row after dynamically inserted setting rows.
-            left.has_css_class("power-profile-mode")
-                .cmp(&right.has_css_class("power-profile-mode"))
-                .into()
+        let experimental_controls = widgets.experimental_controls.clone();
+        model.rows.widget().set_sort_func(move |left, right| {
+            // Keep the cap first, then the opt-in, performance settings, and AMD profile.
+            let rank = |row: &gtk::ListBoxRow| {
+                if row.has_css_class("adjustment-row") {
+                    0
+                } else if row == &experimental_controls {
+                    1
+                } else if row.has_css_class("power-profile-mode") {
+                    3
+                } else {
+                    2
+                }
+            };
+            rank(left).cmp(&rank(right)).into()
         });
 
         ComponentParts { model, widgets }
@@ -144,7 +199,7 @@ impl relm4::Component for PowerFrame {
                                 unit: fl!(I18N, "watt"),
                                 value,
                                 default_value: power.cap_default,
-                                lower,
+                                lower: self.cap_min(Some(lower)),
                                 upper,
                                 ..Default::default()
                             }
@@ -213,7 +268,29 @@ impl relm4::Component for PowerFrame {
                     );
                 }
 
+                self.power = power.clone();
                 self.performance_level_changed(&sender);
+            }
+            // Config arrives before the initial stats rebuild; it is not a user edit.
+            PowerFrameMsg::NvidiaMode(mode) => self.nvidia_mode = mode,
+            PowerFrameMsg::ToggleNvidiaIoctl(enabled) => {
+                let mode = if enabled {
+                    NvidiaPowerCapMode::Ioctl
+                } else {
+                    NvidiaPowerCapMode::Nvml
+                };
+                if self.nvidia_mode_available() && self.nvidia_mode != Some(mode) {
+                    self.nvidia_mode = Some(mode);
+                    if let Some(row) = self.rows.get(&PowerSetting::PowerCap)
+                        && let SettingControl::Adjustment(control) = &row.control
+                    {
+                        control.emit(AdjustmentControlMsg::SetBounds {
+                            lower: self.cap_min(self.power.cap_min),
+                            upper: self.power.cap_max.unwrap_or_default(),
+                        });
+                    }
+                    APP_BROKER.send(AppMsg::SettingsChanged);
+                }
             }
             PowerFrameMsg::SetPerformanceLevel(level) => {
                 if self.rows.get(&PowerSetting::PerformanceLevel).is_some()
@@ -265,6 +342,7 @@ impl PowerFrame {
             .and_then(|power_profile_mode| power_profile_mode.model().serialize());
         PowerFrameSerialized {
             power_cap: value(PowerSetting::PowerCap).and_then(SettingRowValue::as_numeric),
+            nvidia_power_cap_mode: self.nvidia_power_cap_mode(),
             performance_level: selected(PowerSetting::PerformanceLevel)
                 .and_then(|index| PERFORMANCE_LEVELS.get(index as usize).copied()),
             power_mizer_mode: selected(PowerSetting::PowerMizer).and_then(|index| {
@@ -277,6 +355,26 @@ impl PowerFrame {
                 .map(|mode| mode.custom_heuristics)
                 .unwrap_or_default(),
         }
+    }
+
+    fn nvidia_mode_available(&self) -> bool {
+        self.nvidia_mode.is_some()
+            && self.power.cap_min.is_some()
+            && self.rows.get(&PowerSetting::PowerCap).is_some()
+    }
+
+    /// The native minimum, lowered to 30 W while the experimental mode is selected.
+    fn cap_min(&self, native: Option<f64>) -> f64 {
+        let native = native.unwrap_or_default();
+        if self.nvidia_mode == Some(NvidiaPowerCapMode::Ioctl) {
+            native.min(30.0)
+        } else {
+            native
+        }
+    }
+
+    pub fn nvidia_power_cap_mode(&self) -> Option<NvidiaPowerCapMode> {
+        self.nvidia_mode.filter(|_| self.nvidia_mode_available())
     }
 
     fn selected(&self, setting: PowerSetting) -> Option<u32> {
@@ -367,3 +465,7 @@ fn power_mizer_option(mode: PowerMizerMode) -> SelectOption {
     };
     SelectOption { label, description }
 }
+
+#[cfg(all(test, feature = "gtk-tests"))]
+#[path = "power_frame_tests.rs"]
+mod tests;

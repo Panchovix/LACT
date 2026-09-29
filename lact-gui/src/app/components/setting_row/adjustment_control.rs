@@ -43,6 +43,11 @@ pub struct AdjustmentControl {
 #[derive(Debug)]
 pub enum AdjustmentControlMsg {
     Changed,
+    /// Update the permitted range, retaining the raw value and reset default.
+    SetBounds {
+        lower: f64,
+        upper: f64,
+    },
     #[expect(dead_code, reason = "setting-row-migration")]
     SetValueRatio(f64),
 }
@@ -157,6 +162,23 @@ impl Component for AdjustmentControl {
         match msg {
             AdjustmentControlMsg::Changed => {
                 let _ = sender.output(self.get_value());
+            }
+            AdjustmentControlMsg::SetBounds { lower, upper } => {
+                let value = self.get_value().clamp(lower, upper);
+                self.adjustment.configure(
+                    value * self.value_ratio,
+                    lower * self.value_ratio,
+                    upper * self.value_ratio,
+                    self.adjustment.step_increment(),
+                    self.adjustment.page_increment(),
+                    self.adjustment.page_size(),
+                );
+                widgets
+                    .lower_label
+                    .set_label(&fmt_value_with_unit(self.adjustment.lower(), &self.unit));
+                widgets
+                    .upper_label
+                    .set_label(&fmt_value_with_unit(self.adjustment.upper(), &self.unit));
             }
             AdjustmentControlMsg::SetValueRatio(ratio) => {
                 self.adjustment.block_signal(&widgets.value_change_signal);

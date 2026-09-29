@@ -67,6 +67,7 @@ pub enum OcPageMsg {
         vf_curve_is_configured: bool,
     },
     ProfileModesTable(Option<PowerProfileModesTable>),
+    NvidiaPowerCapMode(config::NvidiaPowerCapMode),
     PowerStates {
         pstates: PowerStates,
         configured: bool,
@@ -267,6 +268,14 @@ impl relm4::Component for OcPage {
                     .emit(VfCurveEditorMsg::Clocks(table.clone()));
                 self.msvdd_curve_editor
                     .emit(MsvddCurveEditorMsg::Clocks(table.clone()));
+            }
+            OcPageMsg::NvidiaPowerCapMode(mode) => {
+                // The driver includes its version, e.g. "nvidia 610.57.04".
+                let is_nvidia = self.device_info.as_ref().is_some_and(|info| {
+                    info.driver.split_ascii_whitespace().next() == Some("nvidia")
+                });
+                self.power_frame
+                    .emit(PowerFrameMsg::NvidiaMode(is_nvidia.then_some(mode)));
             }
             OcPageMsg::ProfileModesTable(modes_table) => {
                 self.power_frame
