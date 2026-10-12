@@ -130,3 +130,113 @@ async fn native_pending_without_profile_receipt_still_blocks_mutations() {
     runtime.recover_pending(true).await.unwrap();
     assert!(!runtime.status().await.recovery_required);
 }
+
+/// The whole Apply precondition, not only recover_pending, keeps an unfinished
+/// change of ours fail-closed, even when validation or the first status fail.
+#[tokio::test]
+async fn own_unfinished_change_keeps_every_apply_precondition_fail_closed() {
+    let (dir, mut runtime) = profile_fake();
+    let _staged = runtime.stage(Some(&requested())).await.unwrap();
+    let executable = runtime.config.executable.clone();
+    runtime.config.executable = runtime.config.state_dir.join("missing-helper");
+    for settings in [None, Some(requested())] {
+        let error = runtime
+            .prepare_apply(settings.as_ref(), |_| panic!("validation failed first"))
+            .await
+            .unwrap_err();
+        assert!(!is_unavailable(&error), "{error:#}");
+    }
+    runtime.config.executable = executable;
+    fs::write(dir.path().join("mode"), "status_failure").unwrap();
+    let error = runtime
+        .prepare_apply(None, |_| panic!("the unknown-checkpoint status failed"))
+        .await
+        .unwrap_err();
+    assert!(!is_unavailable(&error), "{error:#}");
+    assert!(!is_unavailable(
+        &runtime.recover(true, |_| Ok(())).await.unwrap_err()
+    ));
+    // A controller without an unfinished change of its own may degrade instead.
+    let restarted = RuntimeControls::new(runtime.config.clone(), runtime.device.clone());
+    let error = restarted.prepare_apply(None, |_| Ok(())).await.unwrap_err();
+    assert!(is_unavailable(&error), "{error:#}");
+}
+
+#[tokio::test]
+async fn recovery_reported_by_a_valid_reply_survives_later_helper_failures() {
+    let (dir, runtime) = profile_fake();
+    let _staged = runtime.stage(Some(&requested())).await.unwrap();
+    let mut restarted = RuntimeControls::new(runtime.config.clone(), runtime.device.clone());
+    // The first status reports another instance's checkpoint; the next one fails.
+    fs::write(dir.path().join("mode"), "status_once").unwrap();
+    let error = restarted
+        .prepare_apply(None, |unknown| {
+            assert!(unknown);
+            Ok(())
+        })
+        .await
+        .unwrap_err();
+    assert!(!is_unavailable(&error), "{error:#}");
+    // Later Applies stay fail-closed while the helper keeps failing.
+    let error = restarted.prepare_apply(None, |_| Ok(())).await.unwrap_err();
+    assert!(!is_unavailable(&error), "{error:#}");
+    // A valid reply without pending recovery allows degrading on a later outage.
+    fs::write(dir.path().join("mode"), "").unwrap();
+    restarted.prepare_apply(None, |_| Ok(())).await.unwrap();
+    restarted.config.executable = restarted.config.state_dir.join("missing-helper");
+    let error = restarted.prepare_apply(None, |_| Ok(())).await.unwrap_err();
+    assert!(is_unavailable(&error), "{error:#}");
+}
+
+#[tokio::test]
+async fn unknown_checkpoint_recovers_frequencies_before_any_rail_rollback() {
+    let (dir, runtime) = profile_fake();
+    let _staged = runtime.stage(Some(&requested())).await.unwrap();
+    let restarted = RuntimeControls::new(runtime.config.clone(), runtime.device.clone());
+    let mut discovered = Vec::new();
+    restarted
+        .prepare_apply(None, |unknown| {
+            assert!(!actions(&dir).iter().any(|action| action == "rollback"));
+            discovered.push(unknown);
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(discovered, [true]);
+    assert!(actions(&dir).iter().any(|action| action == "rollback"));
+    // Nothing unknown remains, so the next preparation needs no discovery.
+    restarted
+        .prepare_apply(None, |unknown| {
+            assert!(!unknown);
+            Ok(())
+        })
+        .await
+        .unwrap();
+}
+
+/// Only an exited helper without any reported or own unfinished transaction
+/// lets the controller apply its independent settings.
+#[tokio::test]
+async fn reported_or_own_unfinished_recovery_is_never_unavailability() {
+    let (dir, runtime) = profile_fake();
+    let staged = runtime.stage(Some(&requested())).await.unwrap();
+    let restarted = RuntimeControls::new(runtime.config.clone(), runtime.device.clone());
+    let reported = restarted.recover_pending(false).await.unwrap_err();
+    assert!(!is_unavailable(&reported), "{reported:#}");
+    fs::write(dir.path().join("mode"), "rollback_failure").unwrap();
+    let ours = runtime.recover_pending(false).await.unwrap_err();
+    assert!(!is_unavailable(&ours), "{ours:#}");
+    let mut stopped = RuntimeControls::new(runtime.config.clone(), runtime.device.clone());
+    *stopped.pending.lock().await = Some(staged);
+    stopped.config.executable = stopped.config.state_dir.join("missing-helper");
+    let unanswered = stopped.recover_pending(false).await.unwrap_err();
+    assert!(!is_unavailable(&unanswered), "{unanswered:#}");
+
+    let (dir, runtime) = profile_fake();
+    fs::write(dir.path().join("mode"), "native_pending_without_receipt").unwrap();
+    assert!(runtime.stage(Some(&requested())).await.is_err());
+    fs::write(dir.path().join("mode"), "restore_failure").unwrap();
+    let native = runtime.recover_pending(true).await.unwrap_err();
+    assert!(!is_unavailable(&native), "{native:#}");
+    assert!(runtime.status().await.recovery_required);
+}

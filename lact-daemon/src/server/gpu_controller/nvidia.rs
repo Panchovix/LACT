@@ -1191,7 +1191,14 @@ impl NvidiaGpuController {
 
     fn apply_thermal_settings(&self, config: &GpuConfig) -> anyhow::Result<()> {
         let device = self.device();
-        if let Some(target_temp_info) = self.get_target_temp()
+        let target_temp_info = self.get_target_temp();
+        // An unreadable range must keep a configured target pending, not applied.
+        ensure!(
+            config.nvidia_thermal_options.target_temperature.is_none()
+                || target_temp_info.is_some(),
+            "Could not read the target temperature range"
+        );
+        if let Some(target_temp_info) = target_temp_info
             && let Some((min, max)) = target_temp_info.allowed_range
         {
             if let Some(target_temp) = config.nvidia_thermal_options.target_temperature {
@@ -1374,17 +1381,26 @@ impl NvidiaGpuController {
     }
 
     async fn recover_runtime_controls(&self, explicit_restore: bool) -> anyhow::Result<()> {
-        if let Some(runtime) = &self.runtime_controls {
-            if explicit_restore && runtime.has_unknown_profile_transaction().await? {
-                self.frequency_recovery_discovery_needed.set(true);
-                self.frequency_recovery_needed.set(true);
+        match &self.runtime_controls {
+            Some(runtime) => {
+                runtime
+                    .recover(explicit_restore, |unknown| {
+                        self.recover_frequencies(unknown)
+                    })
+                    .await
             }
-            self.complete_frequency_recovery()?;
-            runtime.recover_pending(explicit_restore).await?;
-        } else {
-            self.complete_frequency_recovery()?;
+            None => self.complete_frequency_recovery(),
         }
-        Ok(())
+    }
+
+    /// An unknown helper checkpoint means another controller instance may have
+    /// written frequencies, which must be discovered and reset first.
+    fn recover_frequencies(&self, unknown_checkpoint: bool) -> anyhow::Result<()> {
+        if unknown_checkpoint {
+            self.frequency_recovery_discovery_needed.set(true);
+            self.frequency_recovery_needed.set(true);
+        }
+        self.complete_frequency_recovery()
     }
 
     fn complete_frequency_recovery(&self) -> anyhow::Result<()> {
@@ -1411,6 +1427,92 @@ impl NvidiaGpuController {
         if reset_boost && self.voltage_boost_written.get() {
             self.reset_voltage_boost()
                 .context("Could not reset voltage boost")?;
+        }
+        Ok(())
+    }
+
+    /// The helper must be usable and its recovery resolved before any profile group.
+    async fn prepare_runtime_controls(&self, config: &GpuConfig) -> anyhow::Result<()> {
+        let settings = config.nvidia_rail_controls.as_ref();
+        match &self.runtime_controls {
+            Some(runtime) => {
+                runtime
+                    .prepare_apply(settings, |unknown| self.recover_frequencies(unknown))
+                    .await
+            }
+            None if settings.is_some() => Err(runtime_controls::unavailable(anyhow!(
+                "NVIDIA runtime helper is not configured"
+            ))),
+            None => self.complete_frequency_recovery(),
+        }
+    }
+
+    /// Without a usable helper the rail state is unknown, so only power, fan and
+    /// thermal settings are applied; boost, rails and clocks stay pending for an
+    /// Apply after the helper responds. A new power limit can change the policy
+    /// CONTROL that an unfinished native helper transaction verifies, which may
+    /// then require manual recovery.
+    async fn apply_without_runtime_helper(
+        &self,
+        config: &GpuConfig,
+        unavailable: anyhow::Error,
+    ) -> anyhow::Result<()> {
+        self.complete_frequency_recovery()?;
+        let plan = self.applied_state.borrow().plan(config);
+        let new_voltage_request = self.applied_state.borrow_mut().defer_voltage_groups(config);
+        // Without complete(), every attempted group also stays pending.
+        let mut deferred = Vec::new();
+        for group in plan.independent_groups() {
+            self.applied_state.borrow_mut().attempted(group);
+            self.apply_independent_group(config, group, &mut deferred)
+                .await
+                .with_context(|| format!("{unavailable:#}"))?;
+        }
+        let error = unavailable.context(
+            "Applied power, fan and thermal settings; voltage boost, rail and clock settings stay pending",
+        );
+        // New voltage or clock requests cannot take effect, so the change as a
+        // whole failed; otherwise only earlier pending settings are still waiting.
+        if new_voltage_request {
+            Err(error)
+        } else {
+            Err(super::partially_applied(error))
+        }
+    }
+
+    async fn apply_independent_group(
+        &self,
+        config: &GpuConfig,
+        group: apply_plan::Group,
+        deferred: &mut Vec<apply_plan::Group>,
+    ) -> anyhow::Result<()> {
+        match group {
+            apply_plan::Group::PowerCap => {
+                let mut device = self.device();
+                if config.nvidia_power_cap_mode == lact_schema::config::NvidiaPowerCapMode::Ioctl {
+                    driver::power_limit::apply(
+                        self.driver_handle.as_ref(),
+                        &device,
+                        config.power_cap,
+                    )?;
+                } else {
+                    driver::power_limit::ensure_native_range(&device, config.power_cap)?;
+                    apply_power_cap(&mut device, config.power_cap)?;
+                }
+            }
+            apply_plan::Group::PowerMizer => {
+                apply_power_mizer_mode(&mut self.device(), config.power_mizer_mode)?;
+            }
+            apply_plan::Group::Fans => self.apply_fan_settings(config).await?,
+            apply_plan::Group::Thermal => {
+                if let Err(err) = self.apply_thermal_settings(config) {
+                    warn!("{err:#}; retrying on the next apply");
+                    deferred.push(group);
+                }
+            }
+            apply_plan::Group::Boost | apply_plan::Group::Rails | apply_plan::Group::Clocks => {
+                bail!("{group:?} settings depend on rail policies");
+            }
         }
         Ok(())
     }
@@ -1897,17 +1999,16 @@ impl GpuController for NvidiaGpuController {
     fn apply_config<'a>(&'a self, config: &'a GpuConfig) -> LocalBoxFuture<'a, anyhow::Result<()>> {
         Box::pin(async {
             runtime_controls::validate_settings(config.nvidia_rail_controls.as_ref())?;
-            match &self.runtime_controls {
-                Some(runtime) => runtime.validate(config.nvidia_rail_controls.as_ref())?,
-                None => ensure!(
-                    config.nvidia_rail_controls.is_none(),
-                    "NVIDIA runtime helper is not configured"
-                ),
+            if let Err(error) = self.prepare_runtime_controls(config).await {
+                if runtime_controls::is_unavailable(&error) {
+                    return self.apply_without_runtime_helper(config, error).await;
+                }
+                return Err(error);
             }
-            self.recover_runtime_controls(config.nvidia_rail_controls.is_none())
-                .await?;
             let plan = self.applied_state.borrow().plan(config);
             let mut transaction = None;
+            // Groups that failed with a warning are retried by the next Apply.
+            let mut deferred = Vec::new();
             let result: anyhow::Result<()> = async {
                 for step in plan.steps() {
                     match step {
@@ -1920,29 +2021,12 @@ impl GpuController for NvidiaGpuController {
                         apply_plan::Step::Apply(group) => {
                             self.applied_state.borrow_mut().attempted(group);
                             match group {
-                                apply_plan::Group::PowerCap => {
-                                    let mut device = self.device();
-                                    if config.nvidia_power_cap_mode
-                                        == lact_schema::config::NvidiaPowerCapMode::Ioctl
-                                    {
-                                        driver::power_limit::apply(
-                                            self.driver_handle.as_ref(),
-                                            &device,
-                                            config.power_cap,
-                                        )?;
-                                    } else {
-                                        driver::power_limit::ensure_native_range(
-                                            &device,
-                                            config.power_cap,
-                                        )?;
-                                        apply_power_cap(&mut device, config.power_cap)?;
+                                apply_plan::Group::Boost => {
+                                    if let Err(err) = self.apply_boost_setting(config) {
+                                        warn!("{err:#}; retrying on the next apply");
+                                        deferred.push(group);
                                     }
                                 }
-                                apply_plan::Group::PowerMizer => apply_power_mizer_mode(
-                                    &mut self.device(),
-                                    config.power_mizer_mode,
-                                )?,
-                                apply_plan::Group::Boost => self.apply_boost_setting(config)?,
                                 apply_plan::Group::Rails => {
                                     if let Some(runtime) = &self.runtime_controls {
                                         transaction = Some(
@@ -1962,9 +2046,13 @@ impl GpuController for NvidiaGpuController {
                                     }
                                     self.apply_clock_settings(config)?;
                                 }
-                                apply_plan::Group::Fans => self.apply_fan_settings(config).await?,
-                                apply_plan::Group::Thermal => {
-                                    self.apply_thermal_settings(config)?
+                                independent => {
+                                    self.apply_independent_group(
+                                        config,
+                                        independent,
+                                        &mut deferred,
+                                    )
+                                    .await?;
                                 }
                             }
                         }
@@ -1995,7 +2083,11 @@ impl GpuController for NvidiaGpuController {
             }
             self.frequency_recovery_needed.set(false);
             self.frequency_recovery_discovery_needed.set(false);
-            self.applied_state.borrow_mut().complete(config);
+            let mut applied = self.applied_state.borrow_mut();
+            applied.complete(config);
+            for group in deferred {
+                applied.invalidate(group);
+            }
             Ok(())
         })
     }

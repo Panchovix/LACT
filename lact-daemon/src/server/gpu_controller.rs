@@ -38,6 +38,34 @@ use tracing::{error, warn};
 pub type DynGpuController = Box<dyn GpuController>;
 type FanControlHandle = (Rc<Notify>, JoinHandle<()>);
 
+/// An Apply that wrote a consistent part of the requested change and left
+/// only settings that were already pending for a later Apply. Callers keep the
+/// new configuration under the normal confirmation instead of rolling back.
+#[derive(Debug)]
+pub struct PartiallyApplied(anyhow::Error);
+
+impl std::fmt::Display for PartiallyApplied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for PartiallyApplied {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0.source()
+    }
+}
+
+// Only the NVIDIA controller can apply part of a change today.
+#[cfg_attr(not(feature = "nvidia"), allow(dead_code))]
+pub fn partially_applied(error: anyhow::Error) -> anyhow::Error {
+    PartiallyApplied(error).into()
+}
+
+pub fn is_partially_applied(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<PartiallyApplied>())
+}
+
 pub trait GpuController {
     fn controller_type(&self) -> &'static str;
 
