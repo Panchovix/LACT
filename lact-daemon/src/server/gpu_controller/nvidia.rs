@@ -404,6 +404,48 @@ impl NvidiaGpuController {
         Ok(())
     }
 
+    /// Stops the fan loop and hands every fan back to the driver without touching
+    /// clocks or rails, for cleanups that cannot run their full reset.
+    async fn release_fan_control_to_driver(&self) -> anyhow::Result<()> {
+        // The same fan settings must be written again by the next Apply.
+        self.applied_state
+            .borrow_mut()
+            .invalidate(apply_plan::Group::Fans);
+        let mut errors = Vec::new();
+        let task = self.fan_control_handle.take();
+        if let Some((notify, handle)) = task {
+            notify.notify_one();
+            if let Err(err) = handle.await {
+                errors.push(format!("fan control task failed: {err}"));
+            }
+        }
+        // The GPU may be gone during a reload, so look it up without panicking.
+        match self
+            .nvml
+            .device_by_pci_bus_id(self.common.pci_slot_name.as_str())
+        {
+            Ok(mut device) => match device.num_fans() {
+                Ok(count) => {
+                    for fan in 0..count {
+                        if let Err(err) = device.set_default_fan_speed(fan) {
+                            errors.push(format!("fan {fan}: {err}"));
+                        }
+                    }
+                }
+                Err(err) => errors.push(format!("could not get fan count: {err}")),
+            },
+            Err(err) => errors.push(format!("could not access the GPU: {err}")),
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            bail!(
+                "Could not return fan control to the driver: {}",
+                errors.join("; ")
+            )
+        }
+    }
+
     fn try_get_power_states(&self) -> anyhow::Result<PowerStates> {
         let device = self.device();
 
@@ -2110,6 +2152,10 @@ impl GpuController for NvidiaGpuController {
         async { self.recover_runtime_controls(false).await }.boxed_local()
     }
 
+    fn release_fan_control(&self) -> LocalBoxFuture<'_, anyhow::Result<()>> {
+        self.release_fan_control_to_driver().boxed_local()
+    }
+
     fn reset_clocks(&self) -> anyhow::Result<()> {
         ensure!(
             !self.frequency_recovery_needed.get(),
@@ -2129,13 +2175,20 @@ impl GpuController for NvidiaGpuController {
             self.applied_state.borrow_mut().invalidate_all();
             if let Err(err) = self.restore_runtime_controls().await {
                 error!("could not restore NVIDIA runtime controls during cleanup: {err:#}");
-                // Preserve the unresolved helper state and avoid further changes.
+                // Preserve the unresolved helper state, but never leave the fan loop running.
+                if let Err(err) = self.release_fan_control_to_driver().await {
+                    error!("{err:#}");
+                }
                 return;
             }
-            if let Some((fan_notify, fan_handle)) = self.fan_control_handle.take() {
+            let task = self.fan_control_handle.take();
+            if let Some((fan_notify, fan_handle)) = task {
                 debug!("sending stop notification to old fan control task");
                 fan_notify.notify_one();
-                fan_handle.await.unwrap();
+                // A panicked fan task must not take the daemon down during cleanup.
+                if let Err(err) = fan_handle.await {
+                    error!("fan control task failed: {err}");
+                }
                 debug!("finished controller cleanup");
             }
         }
