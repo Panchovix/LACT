@@ -83,7 +83,9 @@ pub struct NvidiaGpuController {
     nvml: Rc<Nvml>,
     common: CommonControllerInfo,
     fan_control_handle: RefCell<Option<FanControlHandle>>,
-    initial_target_temp: Option<u32>,
+    /// The target temperature before the first one set here, read at startup
+    /// or, when unreadable then, just before that first change.
+    initial_target_temp: Cell<Option<u32>>,
 
     nvapi: Option<(Rc<NvApi>, NvPhysicalGpuHandle)>,
     driver_handle: Option<DriverHandle>,
@@ -190,7 +192,7 @@ impl NvidiaGpuController {
             common,
             driver_handle,
             nvapi_thermals_info,
-            initial_target_temp: target_temp,
+            initial_target_temp: Cell::new(target_temp),
             last_util_timestamp: Cell::new(None),
             fan_control_handle: RefCell::new(None),
             last_applied_offsets: RefCell::new(HashMap::new()),
@@ -219,7 +221,7 @@ impl NvidiaGpuController {
     fn get_nvidia_thermal_info(&self) -> NvidiaThermalInfo {
         NvidiaThermalInfo {
             target_temp: self.get_target_temp(),
-            target_temp_default: self.initial_target_temp,
+            target_temp_default: self.initial_target_temp.get(),
         }
     }
 
@@ -828,26 +830,6 @@ impl NvidiaGpuController {
 
         Ok(())
     }
-
-    fn reset_target_temp(&self) -> anyhow::Result<()> {
-        if let Some(initial) = self.initial_target_temp {
-            let device = self.device();
-
-            let current = device.temperature_threshold(TemperatureThreshold::AcousticCurr)?;
-
-            if current != initial {
-                debug!("resetting target temperature to {initial}");
-                device.set_temperature_threshold(
-                    TemperatureThreshold::AcousticCurr,
-                    initial.cast_signed(),
-                )?;
-            }
-        } else {
-            debug!("no initial target temperature was read, skipping reset");
-        }
-
-        Ok(())
-    }
 }
 
 fn vf_curve_point_is_editable(point: ClockClientClkVfPointInfoV1) -> bool {
@@ -1053,6 +1035,59 @@ fn apply_power_cap(device: &mut Device<'_>, power_cap: Option<f64>) -> anyhow::R
     Ok(())
 }
 
+/// The acoustic target temperature thresholds of a GPU.
+trait TargetTemperature {
+    fn threshold(&self, threshold: TemperatureThreshold) -> anyhow::Result<u32>;
+    fn set_target(&self, target: u32) -> anyhow::Result<()>;
+}
+
+impl TargetTemperature for Device<'_> {
+    fn threshold(&self, threshold: TemperatureThreshold) -> anyhow::Result<u32> {
+        Ok(self.temperature_threshold(threshold)?)
+    }
+
+    fn set_target(&self, target: u32) -> anyhow::Result<()> {
+        self.set_temperature_threshold(TemperatureThreshold::AcousticCurr, target.cast_signed())?;
+        Ok(())
+    }
+}
+
+/// Sets the `desired` target temperature or, without one, restores `default`:
+/// the target before the first one set here. Any failure leaves the change
+/// pending; restoring does not need the allowed range.
+fn apply_target_temperature(
+    device: &impl TargetTemperature,
+    desired: Option<u32>,
+    default: &Cell<Option<u32>>,
+) -> anyhow::Result<()> {
+    let target = match (desired, default.get()) {
+        (Some(desired), _) => {
+            let (min, max) = device
+                .threshold(TemperatureThreshold::AcousticMin)
+                .and_then(|min| Ok((min, device.threshold(TemperatureThreshold::AcousticMax)?)))
+                .context("Could not read the target temperature range")?;
+            ensure!(min <= max, "Invalid target temperature range {min}-{max}");
+            desired.clamp(min, max)
+        }
+        (None, Some(default)) => default,
+        // Nothing was set here, so nothing needs restoring.
+        (None, None) => return Ok(()),
+    };
+    let current = device
+        .threshold(TemperatureThreshold::AcousticCurr)
+        .context("Could not read the target temperature")?;
+    if current != target {
+        if default.get().is_none() {
+            default.set(Some(current));
+        }
+        debug!("setting target temperature to {target}");
+        device
+            .set_target(target)
+            .context("Could not set target temperature")?;
+    }
+    Ok(())
+}
+
 impl NvidiaGpuController {
     #[allow(
         clippy::cast_possible_wrap,
@@ -1232,36 +1267,11 @@ impl NvidiaGpuController {
     }
 
     fn apply_thermal_settings(&self, config: &GpuConfig) -> anyhow::Result<()> {
-        let device = self.device();
-        let target_temp_info = self.get_target_temp();
-        // An unreadable range must keep a configured target pending, not applied.
-        ensure!(
-            config.nvidia_thermal_options.target_temperature.is_none()
-                || target_temp_info.is_some(),
-            "Could not read the target temperature range"
-        );
-        if let Some(target_temp_info) = target_temp_info
-            && let Some((min, max)) = target_temp_info.allowed_range
-        {
-            if let Some(target_temp) = config.nvidia_thermal_options.target_temperature {
-                let target_temp = target_temp.clamp(min, max);
-
-                if target_temp_info.current != target_temp {
-                    debug!("setting target temperature to {target_temp}");
-                    device
-                        .set_temperature_threshold(
-                            TemperatureThreshold::AcousticCurr,
-                            target_temp.cast_signed(),
-                        )
-                        .context("Could not set target temperature")?;
-                }
-            } else {
-                self.reset_target_temp()
-                    .context("Could not reset target temperature")?;
-            }
-        }
-
-        Ok(())
+        apply_target_temperature(
+            &self.device(),
+            config.nvidia_thermal_options.target_temperature,
+            &self.initial_target_temp,
+        )
     }
 
     #[allow(clippy::too_many_lines)]
@@ -2361,12 +2371,78 @@ mod tests {
     use super::{
         CLOCK_CLIENT_CLK_VF_POINT_TYPE_PROG, ClockClientClkVfPointInfoV1,
         ClockClientClkVfPointsControlV1, ClockClientClkVfPointsInfoV1,
-        ClockClientClkVfPointsStatusV3, build_curve_control, build_vf_curve,
+        ClockClientClkVfPointsStatusV3, TargetTemperature, TemperatureThreshold,
+        apply_target_temperature, build_curve_control, build_vf_curve,
     };
+    use anyhow::Context;
     use indexmap::IndexMap;
     use lact_schema::config::NvidiaCurvePoint;
+    use std::cell::{Cell, RefCell};
 
     const OFFSET_RANGE: (i32, i32) = (-1000, 1000);
+
+    /// Reads of an unset threshold fail.
+    #[derive(Default)]
+    struct FakeTargetTemperature {
+        current: Cell<Option<u32>>,
+        range: Cell<Option<(u32, u32)>>,
+        sets: RefCell<Vec<u32>>,
+    }
+
+    impl TargetTemperature for FakeTargetTemperature {
+        fn threshold(&self, threshold: TemperatureThreshold) -> anyhow::Result<u32> {
+            match threshold {
+                TemperatureThreshold::AcousticCurr => self.current.get(),
+                TemperatureThreshold::AcousticMin => self.range.get().map(|(min, _)| min),
+                TemperatureThreshold::AcousticMax => self.range.get().map(|(_, max)| max),
+                _ => None,
+            }
+            .context("synthetic read failure")
+        }
+
+        fn set_target(&self, target: u32) -> anyhow::Result<()> {
+            self.sets.borrow_mut().push(target);
+            self.current.set(Some(target));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn removed_target_temperature_stays_pending_until_restored() {
+        let device = FakeTargetTemperature::default();
+        device.current.set(Some(83));
+        device.range.set(Some((65, 90)));
+        let default = Cell::new(Some(83));
+        apply_target_temperature(&device, Some(70), &default).unwrap();
+        // Nothing reads back, so the removal fails and the next Apply retries it.
+        device.current.set(None);
+        device.range.set(None);
+        assert!(apply_target_temperature(&device, None, &default).is_err());
+        assert_eq!(*device.sets.borrow(), [70]);
+        // Restoring needs only the current target, not the range.
+        device.current.set(Some(70));
+        apply_target_temperature(&device, None, &default).unwrap();
+        assert_eq!(*device.sets.borrow(), [70, 83]);
+        apply_target_temperature(&device, None, &default).unwrap();
+        assert_eq!(*device.sets.borrow(), [70, 83]);
+    }
+
+    #[test]
+    fn target_temperature_default_is_the_target_before_the_first_change() {
+        let device = FakeTargetTemperature::default();
+        // Unreadable at startup: nothing was changed, so nothing is restored.
+        let default = Cell::new(None);
+        apply_target_temperature(&device, None, &default).unwrap();
+        assert!(apply_target_temperature(&device, Some(70), &default).is_err());
+        device.current.set(Some(83));
+        device.range.set(Some((90, 65)));
+        assert!(apply_target_temperature(&device, Some(70), &default).is_err());
+        device.range.set(Some((65, 90)));
+        apply_target_temperature(&device, Some(70), &default).unwrap();
+        assert_eq!(default.get(), Some(83));
+        apply_target_temperature(&device, None, &default).unwrap();
+        assert_eq!(*device.sets.borrow(), [70, 83]);
+    }
 
     #[derive(Clone, Copy)]
     struct TestPoint {
