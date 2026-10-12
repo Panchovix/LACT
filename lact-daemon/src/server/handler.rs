@@ -1028,26 +1028,33 @@ impl<'a> Handler {
         if !self.profile_holds.borrow().is_empty() {
             bail!("Cannot change profile while a hold is active");
         }
-        if auto_switch {
+        let switched = if auto_switch {
             self.start_profile_watcher_inner().await;
+            Ok(())
         } else {
             self.stop_profile_watcher().await;
-            self.set_current_profile_inner(name).await?;
-        }
+            self.set_current_profile_inner(name).await?
+        };
 
         let mut config = self.config.write().await;
         config.auto_switch_profiles = auto_switch;
         config.save(&self.config_last_saved)?;
 
-        Ok(())
+        switched
     }
 
     pub(super) async fn set_current_profile(&self, name: Option<Rc<str>>) -> anyhow::Result<()> {
         let _operation = self.try_config_operation()?;
-        self.set_current_profile_inner(name).await
+        self.set_current_profile_inner(name).await?
     }
 
-    async fn set_current_profile_inner(&self, name: Option<Rc<str>>) -> anyhow::Result<()> {
+    /// The outer error means the profile did not change. The inner result
+    /// reports GPU reconciliation or hook failures after the switch took effect,
+    /// so callers still finish the transition and persist it before reporting.
+    async fn set_current_profile_inner(
+        &self,
+        name: Option<Rc<str>>,
+    ) -> anyhow::Result<anyhow::Result<()>> {
         let mut activation_hook = None;
         let mut deactivation_hook = None;
         {
@@ -1068,16 +1075,25 @@ impl<'a> Handler {
         self.cleanup_inner().await;
         self.config.write().await.current_profile = name;
 
-        self.apply_current_config_inner().await?;
+        let reconciled = self.apply_current_config_inner().await;
 
-        if let Some(deactivated) = &deactivation_hook {
-            run_hook_command(deactivated).await?;
+        let hooks = async {
+            if let Some(deactivated) = &deactivation_hook {
+                run_hook_command(deactivated).await?;
+            }
+            if let Some(activated) = &activation_hook {
+                run_hook_command(activated).await?;
+            }
+            anyhow::Ok(())
         }
-        if let Some(activated) = &activation_hook {
-            run_hook_command(activated).await?;
-        }
+        .await;
 
-        Ok(())
+        Ok(match (reconciled, hooks) {
+            (Err(err), Err(hook_err)) => {
+                Err(err.context(format!("Profile hook also failed: {hook_err:#}")))
+            }
+            (reconciled, hooks) => reconciled.and(hooks),
+        })
     }
 
     pub async fn create_profile(
@@ -1132,9 +1148,11 @@ impl<'a> Handler {
         {
             bail!("Cannot delete profile '{name}' while it is held");
         }
-        if self.config.read().await.current_profile.as_deref() == Some(&name) {
-            self.set_current_profile_inner(None).await?;
-        }
+        let switched = if self.config.read().await.current_profile.as_deref() == Some(&name) {
+            self.set_current_profile_inner(None).await?
+        } else {
+            Ok(())
+        };
         self.config
             .write()
             .await
@@ -1148,7 +1166,7 @@ impl<'a> Handler {
             let _ = tx.send(ProfileWatcherCommand::Update).await;
         }
 
-        Ok(())
+        switched
     }
 
     pub async fn move_profile(&self, name: &str, new_position: usize) -> anyhow::Result<()> {
@@ -1306,14 +1324,19 @@ impl<'a> Handler {
             .borrow_mut()
             .push((cookie, name_rc.clone(), release_tx));
 
-        if let Err(err) = self.set_current_profile_inner(Some(name_rc)).await {
-            self.profile_holds
-                .borrow_mut()
-                .retain(|(c, _, _)| *c != cookie);
-            if self.profile_holds.borrow().is_empty() {
-                self.profile_hold_snapshot.borrow_mut().take();
+        match self.set_current_profile_inner(Some(name_rc)).await {
+            Ok(Ok(())) => (),
+            // The held profile is active, so keep the hold that can restore the snapshot.
+            Ok(Err(err)) => error!("profile hold {cookie} is active but incomplete: {err:#}"),
+            Err(err) => {
+                self.profile_holds
+                    .borrow_mut()
+                    .retain(|(c, _, _)| *c != cookie);
+                if self.profile_holds.borrow().is_empty() {
+                    self.profile_hold_snapshot.borrow_mut().take();
+                }
+                return Err(err);
             }
-            return Err(err);
         }
 
         info!("profile hold {cookie} acquired for profile '{name}'");
@@ -1359,7 +1382,8 @@ impl<'a> Handler {
                 .take()
                 .expect("snapshot missing while holds were active");
 
-            self.set_current_profile_inner(profile).await?;
+            // The snapshot is consumed, so finish restoring it even if a GPU fails.
+            let switched = self.set_current_profile_inner(profile).await;
 
             if auto_switch {
                 self.start_profile_watcher_inner().await;
@@ -1368,6 +1392,7 @@ impl<'a> Handler {
             let mut config = self.config.write().await;
             config.auto_switch_profiles = auto_switch;
             config.save(&self.config_last_saved)?;
+            report_released_profile(cookie, switched)?;
         } else if was_top {
             // Active hold released, activate the hold beneath it.
             let target = self
@@ -1376,7 +1401,7 @@ impl<'a> Handler {
                 .last()
                 .map(|(_, name, _)| name.clone())
                 .unwrap();
-            self.set_current_profile_inner(Some(target)).await?;
+            report_released_profile(cookie, self.set_current_profile_inner(Some(target)).await)?;
         }
 
         Ok(())
@@ -1731,6 +1756,18 @@ fn drm_base_path() -> PathBuf {
     }
 }
 
+/// The hold is gone once released, so a failure after its profile switch is
+/// logged instead of being reported as a failed release.
+fn report_released_profile(
+    cookie: u64,
+    switched: anyhow::Result<anyhow::Result<()>>,
+) -> anyhow::Result<()> {
+    if let Err(err) = switched? {
+        error!("profile hold {cookie} was released, but the next profile is incomplete: {err:#}");
+    }
+    Ok(())
+}
+
 async fn run_hook_command(command: &str) -> anyhow::Result<()> {
     let output = Command::new("sh").arg("-c").arg(command).output().await?;
 
@@ -2019,12 +2056,17 @@ mod runtime_config_reconciliation_tests {
         config
             .profiles
             .insert(Rc::from("other"), Profile::default());
-        let handler = Handler {
+        let handler = handler_with(
+            config,
+            BTreeMap::from([("gpu".into(), Box::new(controller) as DynGpuController)]),
+        );
+        (handler, gate, rx)
+    }
+
+    fn handler_with(config: Config, controllers: BTreeMap<String, DynGpuController>) -> Handler {
+        Handler {
             config: Rc::new(RwLock::new(config)),
-            gpu_controllers: Rc::new(RwLock::new(BTreeMap::from([(
-                "gpu".into(),
-                Box::new(controller) as DynGpuController,
-            )]))),
+            gpu_controllers: Rc::new(RwLock::new(controllers)),
             confirm_config_tx: Rc::new(RefCell::new(None)),
             config_operation: Arc::new(Mutex::new(())),
             config_last_saved: Rc::new(Cell::new(Instant::now())),
@@ -2037,8 +2079,7 @@ mod runtime_config_reconciliation_tests {
             polkit_proxy: None,
             ignored_gpu_ids: Rc::new(RwLock::new(vec![])),
             reload_tx: Rc::new(mpsc::channel(1).0),
-        };
-        (handler, gate, rx)
+        }
     }
 
     fn gpu_config(cap: f64) -> GpuConfig {
@@ -2046,6 +2087,69 @@ mod runtime_config_reconciliation_tests {
             power_cap: Some(cap),
             ..GpuConfig::default()
         }
+    }
+
+    /// "bad" fails to apply after the switch; "other" runs an activation hook.
+    fn handler_with_failing_profile(calls: &Rc<RefCell<Vec<Call>>>, marker: &Path) -> Handler {
+        let mut config = Config::default();
+        config.daemon.disable_clocks_cleanup = true;
+        let mut profile = Profile::default();
+        for id in ["bad", "good"] {
+            profile.gpus.insert(id.into(), gpu_config(200.0));
+        }
+        profile.hooks.activated = Some(format!("touch {}", marker.display()));
+        config.profiles.insert(Rc::from("other"), profile);
+        handler_with(
+            config,
+            controllers(calls, &[("bad", true), ("good", false)]),
+        )
+    }
+
+    #[tokio::test]
+    async fn failed_gpu_after_profile_switch_is_reported_after_hooks_and_save() {
+        let marker_dir = tempfile::tempdir().unwrap();
+        let marker = marker_dir.path().join("activated");
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let handler = handler_with_failing_profile(&calls, &marker);
+        let saved = handler.config_last_saved.get();
+        let error = handler
+            .set_profile(Some(Rc::from("other")), false)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("bad: synthetic apply failure"));
+        assert!(calls.borrow().contains(&Call::Apply("good", Some(200.0))));
+        assert_eq!(
+            handler.config.read().await.current_profile.as_deref(),
+            Some("other")
+        );
+        assert!(handler.config_last_saved.get() > saved);
+        assert!(marker.exists());
+    }
+
+    #[tokio::test]
+    async fn failed_gpu_cannot_strand_a_profile_hold_or_its_snapshot() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let marker_dir = tempfile::tempdir().unwrap();
+                let marker = marker_dir.path().join("activated");
+                let calls = Rc::new(RefCell::new(Vec::new()));
+                let handler = handler_with_failing_profile(&calls, &marker);
+                let cookie = handler
+                    .hold_profile("other".into(), Arc::new(tokio::sync::Notify::new()))
+                    .await
+                    .expect("the held profile is active, so its hold must be returned");
+                assert_eq!(
+                    handler.config.read().await.current_profile.as_deref(),
+                    Some("other")
+                );
+                let saved = handler.config_last_saved.get();
+                handler.release_profile(cookie).await.unwrap();
+                assert!(handler.profile_holds.borrow().is_empty());
+                assert!(handler.profile_hold_snapshot.borrow().is_none());
+                assert!(handler.config.read().await.current_profile.is_none());
+                assert!(handler.config_last_saved.get() > saved);
+            })
+            .await;
     }
 
     async fn settled(handler: &Handler) {
