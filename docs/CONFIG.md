@@ -404,6 +404,9 @@ restoration of the previous configuration into a skipped operation. Releasing
 rail controls still checks the provider's durable ownership even when the local
 configuration is unchanged. Voltage boost and target-temperature failures are
 logged as warnings instead of failing the Apply, and the next Apply retries them.
+This includes restoring the default target temperature after removing a
+configured one: the target read at startup, or just before LACT first changed
+it if it was unreadable then.
 
 If the provider cannot run, Apply still sets the power cap, PowerMizer mode,
 fans and target temperature, and keeps voltage boost, rail and clock settings
@@ -414,25 +417,29 @@ report an error but keep those independent settings applied. An Apply from the
 GUI that changes only independent settings keeps them under the normal
 confirmation and revert while earlier voltage settings keep waiting; one that
 changes voltage boost, rails or clocks is rejected, and the previous settings
-are applied the same way. Once the provider works again, Apply again or restart
-the daemon to apply the pending settings.
+are applied the same way. For a GPU without saved settings, the defaults are the
+previous settings. Once the provider works again, Apply again or restart the
+daemon to apply the pending settings.
 
 Every setting stays blocked instead, until a provider reply shows no pending
 recovery, when the provider reported pending recovery, when this daemon has an
-unfinished change, when a provider call that could have written failed, when
-the provider refused a request with its own error (for example because another
-provider process holds the GPU's lock), or while a killed provider process has
-not exited. GPU reloads keep this state; a daemon restart starts from the
-provider's next reply. A new power limit can change policy state that an
-unfinished native provider transaction verifies, which may then require manual
-recovery. Power cap, PowerMizer, fan and target-temperature settings are each
-attempted even if another one of them fails.
+unfinished change, when a provider call that could have written ended without a
+valid reply (even if the request that started it was cancelled), when the
+provider refused a request with its own error (for example because another
+provider process holds the GPU's lock), or while a killed provider process is
+not confirmed to have exited, even if the executable is missing by then. GPU
+reloads keep this state; a daemon restart starts from the provider's next reply.
+A new power limit can change policy state that an unfinished native provider
+transaction verifies, which may then require manual recovery. Power cap,
+PowerMizer, fan and target-temperature settings are each attempted even if
+another one of them fails.
 
-Cleaning up a GPU's controller on shutdown, a profile switch, a GPU reload or a
-detach returns its fans to automatic control. If a reload or profile switch
-cannot recover the provider or reset clocks first, LACT skips the rest of the
-cleanup, which would release rail policies, but still stops the fan control
-loop and hands the fans back. The next Apply writes the fan settings again.
+Cleaning up an NVIDIA GPU's controller on shutdown, a profile switch, a GPU
+reload or a detach tries to return each of its fans to automatic control and
+logs any failure. If a reload or profile switch cannot recover the provider or
+reset clocks first, LACT skips the rest of the cleanup, which would release rail
+policies, but still stops the fan control loop and tries to hand the fans back.
+The next Apply writes the fan settings again.
 
 Providers advertising `capabilities.profile_transactions: 1` support a durable
 profile transaction. LACT stages rail policies with a checkpoint before applying
