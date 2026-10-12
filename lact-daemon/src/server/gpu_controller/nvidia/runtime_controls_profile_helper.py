@@ -24,6 +24,14 @@ def fail(message):
     sys.stderr.write(message)
     sys.exit(2)
 if r["action"] == "status":
+    if mode == "status_failure":
+        fail("status unavailable")
+    if mode == "status_once":
+        counter = Path(state_dir) / "status_count"
+        count = int(counter.read_text()) if counter.exists() else 0
+        counter.write_text(str(count + 1))
+        if count:
+            fail("status unavailable after the first reply")
     token = r.get("transaction_id")
     if token:
         receipt = state["checkpoint"] or state["receipts"].get(token)
@@ -70,6 +78,8 @@ if r["action"] in ("commit", "rollback"):
 if r["action"] == "restore":
     if state["checkpoint"]:
         fail("profile recovery required")
+    if mode == "restore_failure":
+        fail("restore unconfirmed")
     state["native_pending"] = False
     save()
     emit()

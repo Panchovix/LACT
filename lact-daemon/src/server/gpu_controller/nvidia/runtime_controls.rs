@@ -1,6 +1,6 @@
 //! Versioned JSON IPC only; native controls and persistent baselines live in the helper.
 use crate::config::NvidiaRuntimeHelperConfig;
-use anyhow::{Context, bail, ensure};
+use anyhow::{Context, anyhow, bail, ensure};
 use lact_schema::{NvidiaRailControls, NvidiaRuntimeDevice, NvidiaRuntimeInfo};
 use serde::Serialize;
 use std::{
@@ -9,7 +9,10 @@ use std::{
     os::unix::{fs::MetadataExt, process::CommandExt},
     path::{Path, PathBuf},
     process::Stdio,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::{
@@ -21,12 +24,60 @@ use tokio::{
 
 const PROTOCOL_VERSION: u32 = 1;
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
+/// A killed helper still blocked in the driver keeps its native state unknown.
+const REAP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// No valid typed response arrived and no helper process remains, so rail
+/// state is unknown but nothing can still be writing it.
+#[derive(Debug)]
+struct HelperUnavailable(anyhow::Error);
+
+/// A failure after a valid response reported pending native recovery: the
+/// helper verifies unrelated CONTROL then, so other groups must still wait.
+#[derive(Debug)]
+struct RecoveryReported(anyhow::Error);
+
+macro_rules! transparent_error {
+    ($name:ident) => {
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                std::fmt::Display::fmt(&self.0, f)
+            }
+        }
+
+        impl std::error::Error for $name {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.0.source()
+            }
+        }
+    };
+}
+
+transparent_error!(HelperUnavailable);
+transparent_error!(RecoveryReported);
+
+pub(super) fn unavailable(error: anyhow::Error) -> anyhow::Error {
+    HelperUnavailable(error).into()
+}
+
+fn recovery_reported(error: anyhow::Error) -> anyhow::Error {
+    RecoveryReported(error).into()
+}
+
+/// Whether only the independent setting groups may still be applied.
+pub(super) fn is_unavailable(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<HelperUnavailable>())
+        && !error.chain().any(|cause| cause.is::<RecoveryReported>())
+}
 
 pub(super) struct RuntimeControls {
     config: NvidiaRuntimeHelperConfig,
     device: NvidiaRuntimeDevice,
     lock: Arc<Mutex<()>>,
     pending: Mutex<Option<RuntimeTransaction>>,
+    /// The latest valid response reported pending recovery; kept across failed
+    /// calls and Applies until a valid response shows none.
+    recovery_known: AtomicBool,
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -87,18 +138,27 @@ impl RuntimeControls {
             device,
             lock: Arc::new(Mutex::new(())),
             pending: Mutex::new(None),
+            recovery_known: AtomicBool::new(false),
         }
     }
 
     pub(super) fn validate(&self, settings: Option<&NvidiaRailControls>) -> anyhow::Result<()> {
-        self.config.validate()?;
-        ensure!(
-            !self.device.uuid.is_empty(),
-            "NVML UUID unavailable for NVIDIA runtime controls"
-        );
         validate_settings(settings)?;
-        checked_executable(&self.config.executable)?;
-        Ok(())
+        self.ensure_runnable()
+    }
+
+    /// Configuration and installation problems leave the helper unusable.
+    fn ensure_runnable(&self) -> anyhow::Result<()> {
+        let runnable = || {
+            self.config.validate()?;
+            ensure!(
+                !self.device.uuid.is_empty(),
+                "NVML UUID unavailable for NVIDIA runtime controls"
+            );
+            checked_executable(&self.config.executable)?;
+            anyhow::Ok(())
+        };
+        runnable().map_err(unavailable)
     }
 
     pub(super) async fn status(&self) -> NvidiaRuntimeInfo {
@@ -173,9 +233,68 @@ impl RuntimeControls {
             }))
     }
 
+    /// An unfinished change of this controller, or recovery that a valid
+    /// response reported before or during `operation`, may have left a native
+    /// helper transaction behind, so any failure then stays fail-closed.
+    async fn guard_own_pending<T>(
+        &self,
+        operation: impl Future<Output = anyhow::Result<T>>,
+    ) -> anyhow::Result<T> {
+        let ours = self.pending.lock().await.is_some();
+        operation.await.map_err(|error| {
+            if ours || self.recovery_known.load(Ordering::SeqCst) {
+                recovery_reported(error)
+            } else {
+                error
+            }
+        })
+    }
+
+    /// Everything an Apply needs from the helper before writing any group: a
+    /// usable helper and resolved recovery. `recover_frequencies` receives
+    /// whether an unknown checkpoint needs frequency discovery and runs before
+    /// any rail rollback.
+    pub(super) async fn prepare_apply(
+        &self,
+        settings: Option<&NvidiaRailControls>,
+        recover_frequencies: impl FnOnce(bool) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        self.guard_own_pending(async {
+            self.validate(settings)?;
+            self.recover_unguarded(settings.is_none(), recover_frequencies)
+                .await
+        })
+        .await
+    }
+
+    /// Resolve recovery before a reset or an explicit release, as for an Apply.
+    pub(super) async fn recover(
+        &self,
+        explicit_restore: bool,
+        recover_frequencies: impl FnOnce(bool) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        self.guard_own_pending(self.recover_unguarded(explicit_restore, recover_frequencies))
+            .await
+    }
+
+    async fn recover_unguarded(
+        &self,
+        explicit_restore: bool,
+        recover_frequencies: impl FnOnce(bool) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let unknown = explicit_restore && self.has_unknown_profile_transaction().await?;
+        recover_frequencies(unknown)?;
+        self.recover_pending_inner(explicit_restore).await
+    }
+
     /// Resolve a previous interrupted profile before touching boost or clocks.
     /// An unknown checkpoint requires an explicit request to release rail controls.
     pub(super) async fn recover_pending(&self, explicit_restore: bool) -> anyhow::Result<()> {
+        self.guard_own_pending(self.recover_pending_inner(explicit_restore))
+            .await
+    }
+
+    async fn recover_pending_inner(&self, explicit_restore: bool) -> anyhow::Result<()> {
         let mut pending = self.pending.lock().await.clone();
         if let Some(transaction) = pending.as_mut()
             && let TransactionKind::Profile {
@@ -232,18 +351,25 @@ impl RuntimeControls {
                 },
             };
             *self.pending.lock().await = Some(transaction.clone());
-            self.rollback(&transaction).await?;
+            self.rollback(&transaction)
+                .await
+                .map_err(recovery_reported)?;
         } else if info.recovery_required || (!info.available && info.managed) {
             ensure!(
                 explicit_restore,
                 "NVIDIA runtime recovery is required before changing GPU settings"
             );
-            self.apply(None).await?;
-            let restored = self.invoke(Action::Status, None).await?;
-            ensure!(
-                !restored.recovery_required && !restored.managed,
-                "NVIDIA runtime recovery remains pending"
-            );
+            async {
+                self.apply(None).await?;
+                let restored = self.invoke(Action::Status, None).await?;
+                ensure!(
+                    !restored.recovery_required && !restored.managed,
+                    "NVIDIA runtime recovery remains pending"
+                );
+                anyhow::Ok(())
+            }
+            .await
+            .map_err(recovery_reported)?;
         }
         Ok(())
     }
@@ -474,8 +600,12 @@ impl RuntimeControls {
                 invoke_process(config, device, action, settings, transaction_id, request_id).await;
             let _ = tx.send(result);
         });
-        rx.await
-            .context("NVIDIA runtime helper task was interrupted")?
+        let info = rx
+            .await
+            .context("NVIDIA runtime helper task was interrupted")??;
+        self.recovery_known
+            .store(reports_recovery(&info), Ordering::SeqCst);
+        Ok(info)
     }
 }
 
@@ -484,6 +614,12 @@ fn profile_pending(info: &NvidiaRuntimeInfo) -> bool {
         info.transaction_status.as_deref(),
         Some("prepared" | "staged" | "rollback_required")
     )
+}
+
+/// Each of these needs recovery before any other profile group, as handled by
+/// `recover_pending`.
+fn reports_recovery(info: &NvidiaRuntimeInfo) -> bool {
+    profile_pending(info) || info.recovery_required || (!info.available && info.managed)
 }
 
 fn validate_token(value: &str) -> anyhow::Result<()> {
@@ -511,15 +647,20 @@ async fn invoke_process(
     transaction_id: Option<String>,
     request_id: Option<String>,
 ) -> anyhow::Result<NvidiaRuntimeInfo> {
-    let executable = checked_executable(&config.executable)?;
-    let request = serde_json::to_vec(&Request {
-        protocol_version: PROTOCOL_VERSION,
-        action,
-        device: &device,
-        settings: settings.as_ref(),
-        transaction_id: transaction_id.as_deref(),
-        request_id: request_id.as_deref(),
-    })?;
+    // Nothing can write native state before a helper process exists.
+    let prepare = || {
+        let executable = checked_executable(&config.executable)?;
+        let request = serde_json::to_vec(&Request {
+            protocol_version: PROTOCOL_VERSION,
+            action,
+            device: &device,
+            settings: settings.as_ref(),
+            transaction_id: transaction_id.as_deref(),
+            request_id: request_id.as_deref(),
+        })?;
+        anyhow::Ok((executable, request))
+    };
+    let (executable, request) = prepare().map_err(unavailable)?;
     let mut command = Command::new(executable);
     command.as_std_mut().process_group(0);
     command
@@ -532,7 +673,8 @@ async fn invoke_process(
         .kill_on_drop(true);
     let mut child = command
         .spawn()
-        .context("Could not start NVIDIA runtime helper")?;
+        .context("Could not start NVIDIA runtime helper")
+        .map_err(unavailable)?;
     let mut process_group = ProcessGroup(child.id().context("Missing helper process ID")?);
     let mut stdin = child.stdin.take().context("Missing helper stdin")?;
     let stdout = child.stdout.take().context("Missing helper stdout")?;
@@ -584,14 +726,25 @@ async fn invoke_process(
         failure => {
             // Reap the child before releasing serialization. kill_on_drop also covers cancellation.
             process_group.terminate();
-            let _ = timeout(Duration::from_secs(1), child.kill()).await;
-            match failure {
-                Ok(Err(err)) => Err(err),
-                Err(_) => bail!(
+            let reaped = timeout(REAP_TIMEOUT, async {
+                let _ = child.start_kill();
+                child.wait().await
+            })
+            .await
+            .is_ok_and(|status| status.is_ok());
+            let error = match failure {
+                Ok(Err(err)) => err,
+                Err(_) => anyhow!(
                     "NVIDIA runtime helper timed out after {} ms",
                     config.timeout_ms
                 ),
                 Ok(Ok(_)) => unreachable!(),
+            };
+            // A helper that may still be inside a native call keeps rails unknown.
+            if reaped {
+                Err(unavailable(error))
+            } else {
+                Err(error.context("NVIDIA runtime helper did not exit after being killed"))
             }
         }
     }
@@ -969,6 +1122,41 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.timeout_ms, 10_000);
+    }
+
+    #[tokio::test]
+    async fn failures_without_a_typed_response_from_an_exited_helper_are_unavailable() {
+        let (_dir, mut runtime) = fake("pass", 2000);
+        runtime.config.executable = runtime.config.state_dir.join("missing-helper");
+        let missing = runtime.validate(None).unwrap_err();
+        assert!(is_unavailable(&missing), "{missing:#}");
+        assert!(is_unavailable(
+            &runtime.has_unknown_profile_transaction().await.unwrap_err()
+        ));
+        for (body, timeout_ms) in [
+            // A broken interpreter environment, unusable output and a hang.
+            ("sys.stderr.write('ModuleNotFoundError')\nsys.exit(1)", 2000),
+            ("print('not json')", 2000),
+            ("time.sleep(30)", 300),
+        ] {
+            let (_dir, runtime) = fake(body, timeout_ms);
+            let error = runtime.stage(None).await.unwrap_err();
+            assert!(is_unavailable(&error), "{error:#}");
+            assert!(is_unavailable(&error.context("caller context")));
+        }
+        let (_dir, runtime) = fake("pass", 2000);
+        let mut settings = NvidiaRailControls::default();
+        settings.nvvdd.min_voltage_uv = Some(0);
+        let invalid = runtime.validate(Some(&settings)).unwrap_err();
+        assert!(!is_unavailable(&invalid));
+    }
+
+    #[test]
+    fn unavailability_keeps_the_original_message() {
+        let error = unavailable(anyhow!("inner cause").context("outer message"));
+        assert_eq!(error.to_string(), "outer message");
+        assert_eq!(format!("{error:#}"), "outer message: inner cause");
+        assert!(!is_unavailable(&recovery_reported(error)));
     }
 }
 
