@@ -2185,24 +2185,16 @@ impl GpuController for NvidiaGpuController {
     fn cleanup(&self) -> LocalBoxFuture<'_, ()> {
         async {
             self.applied_state.borrow_mut().invalidate_all();
+            // A failed restore keeps the unresolved helper state as it is.
             if let Err(err) = self.restore_runtime_controls().await {
                 error!("could not restore NVIDIA runtime controls during cleanup: {err:#}");
-                // Preserve the unresolved helper state, but never leave the fan loop running.
-                if let Err(err) = self.release_fan_control_to_driver().await {
-                    error!("{err:#}");
-                }
-                return;
             }
-            let task = self.fan_control_handle.take();
-            if let Some((fan_notify, fan_handle)) = task {
-                debug!("sending stop notification to old fan control task");
-                fan_notify.notify_one();
-                // A panicked fan task must not take the daemon down during cleanup.
-                if let Err(err) = fan_handle.await {
-                    error!("fan control task failed: {err}");
-                }
-                debug!("finished controller cleanup");
+            // A dropped or detached controller must not leave its fans at the
+            // last manual duty with nothing driving them.
+            if let Err(err) = self.release_fan_control_to_driver().await {
+                error!("{err:#}");
             }
+            debug!("finished controller cleanup");
         }
         .boxed_local()
     }
