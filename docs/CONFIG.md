@@ -415,16 +415,24 @@ GUI that changes only independent settings keeps them under the normal
 confirmation and revert while earlier voltage settings keep waiting; one that
 changes voltage boost, rails or clocks is rejected, and the previous settings
 are applied the same way. Once the provider works again, Apply again or restart
-the daemon to apply the pending settings. A provider response that reports
-pending recovery, an unfinished change of this daemon, or a provider process
-that did not exit after being killed still blocks every setting until recovery
-completes. A new power limit can change policy state that an unfinished native
-provider transaction verifies, which may then require manual recovery.
+the daemon to apply the pending settings.
 
-If a GPU reload or profile switch cannot recover the provider or reset clocks
-first, LACT skips the full cleanup, which would release rail policies, but still
-stops its fan control loop and returns the fans to automatic control. The next
-Apply writes the fan settings again.
+Every setting stays blocked instead, until a provider reply shows no pending
+recovery, when the provider reported pending recovery, when this daemon has an
+unfinished change, when a provider call that could have written failed, when
+the provider refused a request with its own error (for example because another
+provider process holds the GPU's lock), or while a killed provider process has
+not exited. GPU reloads keep this state; a daemon restart starts from the
+provider's next reply. A new power limit can change policy state that an
+unfinished native provider transaction verifies, which may then require manual
+recovery. Power cap, PowerMizer, fan and target-temperature settings are each
+attempted even if another one of them fails.
+
+Cleaning up a GPU's controller on shutdown, a profile switch, a GPU reload or a
+detach returns its fans to automatic control. If a reload or profile switch
+cannot recover the provider or reset clocks first, LACT skips the rest of the
+cleanup, which would release rail policies, but still stops the fan control
+loop and hands the fans back. The next Apply writes the fan settings again.
 
 Providers advertising `capabilities.profile_transactions: 1` support a durable
 profile transaction. LACT stages rail policies with a checkpoint before applying
