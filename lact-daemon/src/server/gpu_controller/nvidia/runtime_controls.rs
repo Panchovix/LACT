@@ -4,20 +4,21 @@ use anyhow::{Context, anyhow, bail, ensure};
 use lact_schema::{NvidiaRailControls, NvidiaRuntimeDevice, NvidiaRuntimeInfo};
 use serde::Serialize;
 use std::{
+    collections::HashMap,
     fs,
     io::Read,
     os::unix::{fs::MetadataExt, process::CommandExt},
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
-        Arc,
+        Arc, LazyLock, PoisonError,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
-    process::Command,
+    process::{Child, Command},
     sync::{Mutex, oneshot},
     time::timeout,
 };
@@ -37,6 +38,11 @@ struct HelperUnavailable(anyhow::Error);
 #[derive(Debug)]
 struct RecoveryReported(anyhow::Error);
 
+/// The helper ran and refused the request with its typed error, for example
+/// because another helper process holds this GPU's lock.
+#[derive(Debug)]
+struct HelperRefused(anyhow::Error);
+
 macro_rules! transparent_error {
     ($name:ident) => {
         impl std::fmt::Display for $name {
@@ -55,6 +61,7 @@ macro_rules! transparent_error {
 
 transparent_error!(HelperUnavailable);
 transparent_error!(RecoveryReported);
+transparent_error!(HelperRefused);
 
 pub(super) fn unavailable(error: anyhow::Error) -> anyhow::Error {
     HelperUnavailable(error).into()
@@ -73,11 +80,35 @@ pub(super) fn is_unavailable(error: &anyhow::Error) -> bool {
 pub(super) struct RuntimeControls {
     config: NvidiaRuntimeHelperConfig,
     device: NvidiaRuntimeDevice,
-    lock: Arc<Mutex<()>>,
+    guard: Arc<DeviceGuard>,
     pending: Mutex<Option<RuntimeTransaction>>,
-    /// The latest valid response reported pending recovery; kept across failed
-    /// calls and Applies until a valid response shows none.
-    recovery_known: AtomicBool,
+    reap_timeout: Duration,
+}
+
+/// Helper state shared by every controller instance of one GPU, so a reload
+/// keeps serializing helper processes and cannot forget unresolved recovery or
+/// a killed helper that has not exited.
+#[derive(Default)]
+struct DeviceGuard {
+    lock: Arc<Mutex<()>>,
+    /// Set by a valid reply that reports recovery and by any failed call that
+    /// could have written; cleared only by a valid reply without recovery.
+    recovery_outstanding: AtomicBool,
+    /// A killed helper may still be inside a native call.
+    unreaped: Arc<AtomicBool>,
+}
+
+/// Keyed by GPU UUID and BDF.
+type DeviceGuards = std::sync::Mutex<HashMap<(String, String), Arc<DeviceGuard>>>;
+
+fn device_guard(device: &NvidiaRuntimeDevice) -> Arc<DeviceGuard> {
+    static GUARDS: LazyLock<DeviceGuards> = LazyLock::new(Default::default);
+    GUARDS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entry((device.uuid.clone(), device.bdf.clone()))
+        .or_default()
+        .clone()
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -89,6 +120,13 @@ enum Action {
     Stage,
     Commit,
     Rollback,
+}
+
+impl Action {
+    /// Whether an unconfirmed call may have changed native helper state.
+    fn may_write(self) -> bool {
+        !matches!(self, Self::Status)
+    }
 }
 
 #[derive(Serialize)]
@@ -133,13 +171,34 @@ impl RuntimeTransaction {
 
 impl RuntimeControls {
     pub(super) fn new(config: NvidiaRuntimeHelperConfig, device: NvidiaRuntimeDevice) -> Self {
+        let guard = device_guard(&device);
+        Self::with_guard(config, device, guard)
+    }
+
+    fn with_guard(
+        config: NvidiaRuntimeHelperConfig,
+        device: NvidiaRuntimeDevice,
+        guard: Arc<DeviceGuard>,
+    ) -> Self {
         Self {
             config,
             device,
-            lock: Arc::new(Mutex::new(())),
+            guard,
             pending: Mutex::new(None),
-            recovery_known: AtomicBool::new(false),
+            reap_timeout: REAP_TIMEOUT,
         }
+    }
+
+    /// Another controller instance of the same GPU, as after a GPU reload.
+    #[cfg(test)]
+    fn reloaded(&self) -> Self {
+        Self::with_guard(self.config.clone(), self.device.clone(), self.guard.clone())
+    }
+
+    /// The same GPU in a newly started daemon, which remembers nothing.
+    #[cfg(test)]
+    fn restarted(&self) -> Self {
+        Self::with_guard(self.config.clone(), self.device.clone(), Arc::default())
     }
 
     pub(super) fn validate(&self, settings: Option<&NvidiaRailControls>) -> anyhow::Result<()> {
@@ -242,7 +301,7 @@ impl RuntimeControls {
     ) -> anyhow::Result<T> {
         let ours = self.pending.lock().await.is_some();
         operation.await.map_err(|error| {
-            if ours || self.recovery_known.load(Ordering::SeqCst) {
+            if ours || self.guard.recovery_outstanding.load(Ordering::SeqCst) {
                 recovery_reported(error)
             } else {
                 error
@@ -586,26 +645,55 @@ impl RuntimeControls {
         for token in [transaction_id, request_id].into_iter().flatten() {
             validate_token(token)?;
         }
-        let guard = self.lock.clone().lock_owned().await;
+        let lock = self.guard.lock.clone().lock_owned().await;
+        // A killed helper may still be inside a native call; never start another.
+        ensure!(
+            !self.guard.unreaped.load(Ordering::SeqCst),
+            "A killed NVIDIA runtime helper has not exited yet"
+        );
+        let unreaped = self.guard.unreaped.clone();
         let config = self.config.clone();
         let device = self.device.clone();
         let settings = settings.cloned();
         let transaction_id = transaction_id.map(str::to_owned);
         let request_id = request_id.map(str::to_owned);
+        let reap_timeout = self.reap_timeout;
         let (tx, rx) = oneshot::channel();
         // Cancellation must not unlock the GPU while its child is still running.
         tokio::spawn(async move {
-            let _guard = guard;
-            let result =
-                invoke_process(config, device, action, settings, transaction_id, request_id).await;
+            let _lock = lock;
+            let request = HelperRequest {
+                action,
+                settings,
+                transaction_id,
+                request_id,
+            };
+            let (result, running) = invoke_process(config, device, request, reap_timeout).await;
+            if let Some(mut child) = running {
+                unreaped.store(true, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let _ = child.wait().await;
+                    unreaped.store(false, Ordering::SeqCst);
+                });
+            }
             let _ = tx.send(result);
         });
-        let info = rx
+        let result = rx
             .await
-            .context("NVIDIA runtime helper task was interrupted")??;
-        self.recovery_known
-            .store(reports_recovery(&info), Ordering::SeqCst);
-        Ok(info)
+            .context("NVIDIA runtime helper task was interrupted")
+            .and_then(|result| result);
+        match &result {
+            Ok(info) => self
+                .guard
+                .recovery_outstanding
+                .store(reports_recovery(info), Ordering::SeqCst),
+            Err(_) if action.may_write() => self
+                .guard
+                .recovery_outstanding
+                .store(true, Ordering::SeqCst),
+            Err(_) => (),
+        }
+        result
     }
 }
 
@@ -639,28 +727,39 @@ fn new_request_id() -> anyhow::Result<String> {
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-async fn invoke_process(
-    config: NvidiaRuntimeHelperConfig,
-    device: NvidiaRuntimeDevice,
+/// The owned request of one helper process.
+struct HelperRequest {
     action: Action,
     settings: Option<NvidiaRailControls>,
     transaction_id: Option<String>,
     request_id: Option<String>,
-) -> anyhow::Result<NvidiaRuntimeInfo> {
+}
+
+/// Also returns the child when it was killed but did not exit within
+/// `reap_timeout`, so that no other helper runs until it does.
+async fn invoke_process(
+    config: NvidiaRuntimeHelperConfig,
+    device: NvidiaRuntimeDevice,
+    request: HelperRequest,
+    reap_timeout: Duration,
+) -> (anyhow::Result<NvidiaRuntimeInfo>, Option<Child>) {
     // Nothing can write native state before a helper process exists.
     let prepare = || {
         let executable = checked_executable(&config.executable)?;
-        let request = serde_json::to_vec(&Request {
+        let payload = serde_json::to_vec(&Request {
             protocol_version: PROTOCOL_VERSION,
-            action,
+            action: request.action,
             device: &device,
-            settings: settings.as_ref(),
-            transaction_id: transaction_id.as_deref(),
-            request_id: request_id.as_deref(),
+            settings: request.settings.as_ref(),
+            transaction_id: request.transaction_id.as_deref(),
+            request_id: request.request_id.as_deref(),
         })?;
-        anyhow::Ok((executable, request))
+        anyhow::Ok((executable, payload))
     };
-    let (executable, request) = prepare().map_err(unavailable)?;
+    let (executable, payload) = match prepare() {
+        Ok(prepared) => prepared,
+        Err(err) => return (Err(unavailable(err)), None),
+    };
     let mut command = Command::new(executable);
     command.as_std_mut().process_group(0);
     command
@@ -671,18 +770,21 @@ async fn invoke_process(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let mut child = command
-        .spawn()
-        .context("Could not start NVIDIA runtime helper")
-        .map_err(unavailable)?;
-    let mut process_group = ProcessGroup(child.id().context("Missing helper process ID")?);
-    let mut stdin = child.stdin.take().context("Missing helper stdin")?;
-    let stdout = child.stdout.take().context("Missing helper stdout")?;
-    let stderr = child.stderr.take().context("Missing helper stderr")?;
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            let err = anyhow::Error::new(err).context("Could not start NVIDIA runtime helper");
+            return (Err(unavailable(err)), None);
+        }
+    };
+    let mut process_group = ProcessGroup(child.id().unwrap_or(0));
     let operation = async {
+        let mut stdin = child.stdin.take().context("Missing helper stdin")?;
+        let stdout = child.stdout.take().context("Missing helper stdout")?;
+        let stderr = child.stderr.take().context("Missing helper stderr")?;
         let write = async {
             stdin
-                .write_all(&request)
+                .write_all(&payload)
                 .await
                 .context("Could not write helper request")?;
             stdin
@@ -699,11 +801,17 @@ async fn invoke_process(
                     .await
                     .context("Could not wait for runtime helper")
             },)?;
-        ensure!(
-            status.success(),
-            "NVIDIA runtime helper failed ({status}): {}",
-            String::from_utf8_lossy(&stderr)
-        );
+        if !status.success() {
+            let error = anyhow!(
+                "NVIDIA runtime helper failed ({status}): {}",
+                String::from_utf8_lossy(&stderr)
+            );
+            return Err(if typed_refusal(&stderr) {
+                HelperRefused(error).into()
+            } else {
+                error
+            });
+        }
         let info: NvidiaRuntimeInfo =
             serde_json::from_slice(&stdout).context("Invalid NVIDIA runtime helper JSON")?;
         ensure!(
@@ -721,12 +829,12 @@ async fn invoke_process(
     match result {
         Ok(Ok(info)) => {
             process_group.0 = 0;
-            Ok(info)
+            (Ok(info), None)
         }
         failure => {
             // Reap the child before releasing serialization. kill_on_drop also covers cancellation.
             process_group.terminate();
-            let reaped = timeout(REAP_TIMEOUT, async {
+            let reaped = timeout(reap_timeout, async {
                 let _ = child.start_kill();
                 child.wait().await
             })
@@ -740,14 +848,32 @@ async fn invoke_process(
                 ),
                 Ok(Ok(_)) => unreachable!(),
             };
-            // A helper that may still be inside a native call keeps rails unknown.
-            if reaped {
-                Err(unavailable(error))
+            if !reaped {
+                // It may still be inside a native call, so rails stay unknown.
+                let error = error.context("NVIDIA runtime helper did not exit after being killed");
+                return (Err(error), Some(child));
+            }
+            // A typed refusal means the helper ran and judged its own state.
+            if error.chain().any(|cause| cause.is::<HelperRefused>()) {
+                (Err(error), None)
             } else {
-                Err(error.context("NVIDIA runtime helper did not exit after being killed"))
+                (Err(unavailable(error)), None)
             }
         }
     }
+}
+
+/// The bridge reports its own errors as a single JSON object on stderr.
+fn typed_refusal(stderr: &[u8]) -> bool {
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .is_some_and(|value| {
+            value.get("protocol_version") == Some(&serde_json::json!(PROTOCOL_VERSION))
+                && value.get("error").is_some_and(serde_json::Value::is_string)
+        })
 }
 
 /// Keep descendants from retaining IPC pipes after failure or cancellation.
@@ -879,7 +1005,8 @@ mod tests {
             .status()
             .unwrap();
         assert!(installed.success());
-        let runtime = RuntimeControls::new(
+        // A guard of its own keeps parallel tests from sharing helper state.
+        let runtime = RuntimeControls::with_guard(
             NvidiaRuntimeHelperConfig {
                 executable,
                 state_dir: dir.path().to_owned(),
@@ -889,6 +1016,7 @@ mod tests {
                 uuid: "GPU-test".into(),
                 bdf: "0000:09:00.0".into(),
             },
+            Arc::default(),
         );
         (dir, runtime)
     }
@@ -1156,7 +1284,72 @@ mod tests {
         let error = unavailable(anyhow!("inner cause").context("outer message"));
         assert_eq!(error.to_string(), "outer message");
         assert_eq!(format!("{error:#}"), "outer message: inner cause");
-        assert!(!is_unavailable(&recovery_reported(error)));
+        // Reported recovery overrides an unavailability found deeper in the chain.
+        let reported = recovery_reported(error.context("caller"));
+        assert!(
+            reported
+                .chain()
+                .any(|cause| cause.is::<HelperUnavailable>())
+        );
+        assert!(!is_unavailable(&reported));
+    }
+
+    #[tokio::test]
+    async fn typed_helper_refusal_is_never_unavailability() {
+        // The bridge refuses while another helper process holds this GPU's lock.
+        let (_dir, runtime) = fake(
+            "sys.stderr.write(json.dumps({'protocol_version':1,'error':'ValidationError','message':'Another runtime request holds this GPU lock'})+'\\n')\nsys.exit(2)",
+            2000,
+        );
+        let error = runtime.prepare_apply(None, |_| Ok(())).await.unwrap_err();
+        assert!(!is_unavailable(&error), "{error:#}");
+        assert!(format!("{error:#}").contains("holds this GPU lock"));
+    }
+
+    #[tokio::test]
+    async fn killed_helper_that_has_not_exited_blocks_every_later_call() {
+        let (dir, runtime) = fake(
+            &format!("open(os.path.join(state_dir,'started'),'a').close()\nprint({RESPONSE:?})"),
+            2000,
+        );
+        runtime.guard.unreaped.store(true, Ordering::SeqCst);
+        let error = runtime.prepare_apply(None, |_| Ok(())).await.unwrap_err();
+        assert!(!is_unavailable(&error), "{error:#}");
+        assert!(
+            runtime
+                .reloaded()
+                .prepare_apply(None, |_| Ok(()))
+                .await
+                .is_err()
+        );
+        assert!(!dir.path().join("started").exists());
+        runtime.guard.unreaped.store(false, Ordering::SeqCst);
+        runtime.prepare_apply(None, |_| Ok(())).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_writes_keep_recovery_outstanding_until_a_clean_status() {
+        let (dir, runtime) = fake(
+            &format!(
+                "mode_path=os.path.join(state_dir,'mode')\nif os.path.exists(mode_path) and open(mode_path).read()=='fail': sys.exit(1)\nprint({RESPONSE:?})"
+            ),
+            2000,
+        );
+        let mode = |value: &str| fs::write(dir.path().join("mode"), value).unwrap();
+        mode("fail");
+        // A restore may have written before it failed without a reply.
+        assert!(runtime.apply(None).await.is_err());
+        let error = runtime.prepare_apply(None, |_| Ok(())).await.unwrap_err();
+        assert!(!is_unavailable(&error), "{error:#}");
+        let reloaded = runtime.reloaded();
+        let error = reloaded.prepare_apply(None, |_| Ok(())).await.unwrap_err();
+        assert!(!is_unavailable(&error), "{error:#}");
+        // A clean status clears it, so a later outage may degrade again.
+        mode("");
+        runtime.prepare_apply(None, |_| Ok(())).await.unwrap();
+        mode("fail");
+        let error = runtime.prepare_apply(None, |_| Ok(())).await.unwrap_err();
+        assert!(is_unavailable(&error), "{error:#}");
     }
 }
 
