@@ -2125,6 +2125,7 @@ mod runtime_config_reconciliation_tests {
         for id in ["bad", "good"] {
             profile.gpus.insert(id.into(), gpu_config(200.0));
         }
+        config.profiles.insert(Rc::from("other2"), profile.clone());
         profile.hooks.activated = Some(format!("touch {}", marker.display()));
         config.profiles.insert(Rc::from("other"), profile);
         handler_with(
@@ -2172,6 +2173,49 @@ mod runtime_config_reconciliation_tests {
                 );
                 let saved = handler.config_last_saved.get();
                 handler.release_profile(cookie).await.unwrap();
+                assert!(handler.profile_holds.borrow().is_empty());
+                assert!(handler.profile_hold_snapshot.borrow().is_none());
+                assert!(handler.config.read().await.current_profile.is_none());
+                assert!(handler.config_last_saved.get() > saved);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn deleting_the_active_profile_with_a_failed_gpu_still_deletes_and_saves() {
+        let marker_dir = tempfile::tempdir().unwrap();
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let handler = handler_with_failing_profile(&calls, &marker_dir.path().join("hook"));
+        handler.config.write().await.current_profile = Some(Rc::from("other"));
+        let saved = handler.config_last_saved.get();
+        let error = handler.delete_profile("other".into()).await.unwrap_err();
+        // The default profile omits both GPUs, so "bad" fails to release.
+        assert!(format!("{error:#}").contains("bad: synthetic restore failure"));
+        let config = handler.config.read().await;
+        assert!(config.current_profile.is_none());
+        assert!(!config.profiles.contains_key("other"));
+        assert!(handler.config_last_saved.get() > saved);
+    }
+
+    #[tokio::test]
+    async fn nested_holds_with_a_failed_gpu_restore_their_profiles_and_snapshot() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let marker_dir = tempfile::tempdir().unwrap();
+                let calls = Rc::new(RefCell::new(Vec::new()));
+                let handler = handler_with_failing_profile(&calls, &marker_dir.path().join("hook"));
+                let hold = |name: &str| {
+                    handler.hold_profile(name.into(), Arc::new(tokio::sync::Notify::new()))
+                };
+                let outer = hold("other").await.unwrap();
+                let inner = hold("other2").await.unwrap();
+                handler.release_profile(inner).await.unwrap();
+                assert_eq!(
+                    handler.config.read().await.current_profile.as_deref(),
+                    Some("other")
+                );
+                let saved = handler.config_last_saved.get();
+                handler.release_profile(outer).await.unwrap();
                 assert!(handler.profile_holds.borrow().is_empty());
                 assert!(handler.profile_hold_snapshot.borrow().is_none());
                 assert!(handler.config.read().await.current_profile.is_none());
