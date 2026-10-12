@@ -1447,6 +1447,40 @@ impl GpuController for AmdGpuController {
         .boxed_local()
     }
 
+    fn release_fan_control(&self) -> LocalBoxFuture<'_, anyhow::Result<()>> {
+        async {
+            let mut errors = Vec::new();
+            let task = self.fan_control_handle.take();
+            if let Some((notify, handle)) = task {
+                notify.notify_one();
+                if let Err(err) = handle.await {
+                    errors.push(format!("fan control task failed: {err}"));
+                }
+            }
+            // Each restoration step runs on its own, so one failure cannot skip the
+            // next or be reported as success.
+            if self.handle.get_fan_curve().is_ok()
+                && let Err(err) = self.handle.reset_fan_curve()
+            {
+                errors.push(format!("could not reset the fan curve: {err:#}"));
+            }
+            if let Some(hw_mon) = self.handle.hw_monitors.first()
+                && let Err(err) = hw_mon.set_fan_control_method(FanControlMethod::Auto)
+            {
+                errors.push(format!("could not set automatic fan control: {err:#}"));
+            }
+            if errors.is_empty() {
+                Ok(())
+            } else {
+                bail!(
+                    "Could not return fan control to the driver: {}",
+                    errors.join("; ")
+                )
+            }
+        }
+        .boxed_local()
+    }
+
     fn process_list(&self) -> anyhow::Result<ProcessList> {
         let mut last_total_time_map = self.last_drm_util.borrow_mut();
         fdinfo::read_process_list(
