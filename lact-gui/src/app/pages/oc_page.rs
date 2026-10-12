@@ -2,6 +2,7 @@ mod card_layout;
 mod clocks_frame;
 mod igpu_frame;
 mod msvdd_curve;
+mod nvidia_rails_frame;
 mod performance_frame;
 mod power_frame;
 mod power_states;
@@ -25,6 +26,7 @@ use indexmap::IndexMap;
 use lact_schema::config;
 use lact_schema::{ClocksTable, DeviceInfo, PowerStates};
 use msvdd_curve::{MsvddCurveEditor, MsvddCurveEditorMsg};
+use nvidia_rails_frame::{NvidiaRailsFrame, NvidiaRailsFrameMsg};
 use nvml_wrapper::enums::device::PowerMizerMode;
 use performance_frame::PerformanceFrameMsg;
 use power_frame::{PowerFrame, PowerFrameMsg};
@@ -41,6 +43,7 @@ pub struct OcPage {
     device_info: Option<Arc<DeviceInfo>>,
 
     power_frame: relm4::Controller<PowerFrame>,
+    nvidia_rails_frame: relm4::Controller<NvidiaRailsFrame>,
     power_states_dialog: relm4::Controller<PowerStatesDialog>,
     gpu_clocks_frame: relm4::Controller<ClocksFrame>,
     vram_clocks_frame: relm4::Controller<ClocksFrame>,
@@ -63,6 +66,11 @@ pub enum OcPageMsg {
     },
     ProfileModesTable(Option<PowerProfileModesTable>),
     NvidiaPowerCapMode(config::NvidiaPowerCapMode),
+    NvidiaRailControls(Option<lact_schema::NvidiaRailControls>),
+    NvidiaRuntimeInfo {
+        is_nvidia: bool,
+        info: Option<lact_schema::NvidiaRuntimeInfo>,
+    },
     PowerStates {
         pstates: PowerStates,
         configured: bool,
@@ -99,6 +107,7 @@ impl relm4::Component for OcPage {
                     ColumnBias::Left,    // Power
                     ColumnBias::Right,   // Integrated Graphics
                     ColumnBias::Left,    // Advanced
+                    ColumnBias::Right,   // NVIDIA rails
 
                 ])),
                 set_valign: gtk::Align::Start,
@@ -120,6 +129,10 @@ impl relm4::Component for OcPage {
                 },
 
                 model.advanced_clocks_frame.widget() {
+                    add_css_class: "oc-page-section",
+                },
+
+                model.nvidia_rails_frame.widget() {
                     add_css_class: "oc-page-section",
                 },
             },
@@ -170,6 +183,7 @@ impl relm4::Component for OcPage {
         .forward(sender.input_sender(), |msg| msg);
         let power_frame = PowerFrame::launch_default().forward(sender.input_sender(), |msg| msg);
         let igpu_frame = IGpuFrame::launch_default().forward(sender.input_sender(), |msg| msg);
+        let nvidia_rails_frame = NvidiaRailsFrame::launch_default().detach();
 
         let vf_curve_editor = VfCurveEditor::detach(VfCurveEditorInit {
             global_settings_changed: settings_changed,
@@ -181,6 +195,7 @@ impl relm4::Component for OcPage {
             stats_section,
             device_info: None,
             power_frame,
+            nvidia_rails_frame,
             power_states_dialog,
             gpu_clocks_frame,
             vram_clocks_frame,
@@ -236,6 +251,10 @@ impl relm4::Component for OcPage {
                     let vram_clock_ratio = info.vram_clock_ratio();
 
                     self.device_info = Some(info.clone());
+                    self.nvidia_rails_frame.emit(NvidiaRailsFrameMsg::Info {
+                        is_nvidia: info.driver.split_ascii_whitespace().next() == Some("nvidia"),
+                        info: info.nvidia_runtime.clone(),
+                    });
                     self.stats_section
                         .emit(GpuStatsSectionMsg::Info(info.clone()));
                     self.power_states_dialog
@@ -281,6 +300,14 @@ impl relm4::Component for OcPage {
                 });
                 self.power_frame
                     .emit(PowerFrameMsg::NvidiaMode(is_nvidia.then_some(mode)));
+            }
+            OcPageMsg::NvidiaRuntimeInfo { is_nvidia, info } => {
+                self.nvidia_rails_frame
+                    .emit(NvidiaRailsFrameMsg::Info { is_nvidia, info });
+            }
+            OcPageMsg::NvidiaRailControls(config) => {
+                self.nvidia_rails_frame
+                    .emit(NvidiaRailsFrameMsg::Config(config));
             }
             OcPageMsg::ProfileModesTable(modes_table) => {
                 self.power_frame.emit(PowerFrameMsg::Performance(
@@ -382,6 +409,14 @@ impl OcPage {
 
     pub fn get_nvidia_power_cap_mode(&self) -> Option<config::NvidiaPowerCapMode> {
         self.power_frame.model().nvidia_power_cap_mode()
+    }
+
+    pub fn validate_nvidia_rail_config(&self) -> anyhow::Result<()> {
+        self.nvidia_rails_frame.model().validate()
+    }
+
+    pub fn apply_nvidia_rail_config(&self, config: &mut config::GpuConfig) -> anyhow::Result<()> {
+        self.nvidia_rails_frame.model().apply_config(config)
     }
 
     pub fn apply_clocks_config(&self, config: &mut config::ClocksConfiguration) {

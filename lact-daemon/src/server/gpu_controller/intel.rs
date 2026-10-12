@@ -762,6 +762,7 @@ impl GpuController for IntelGpuController {
                 link_info: LinkInfo::default(),
                 drm_info: Some(drm_info),
                 flags,
+                nvidia_runtime: None,
             }
         })
     }

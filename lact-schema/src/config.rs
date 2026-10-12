@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 
 use crate::{
-    FanControlMode, FanCurveMap, NvidiaThermalOptions, PmfwOptions, ProfileRule, default_fan_curve,
+    FanControlMode, FanCurveMap, NvidiaRailControls, NvidiaThermalOptions, PmfwOptions,
+    ProfileRule, default_fan_curve,
     request::{ClockspeedType, SetClocksCommand},
 };
 
@@ -42,6 +43,9 @@ pub struct GpuConfig {
     pub pmfw_options: PmfwOptions,
     #[serde(default, skip_serializing_if = "NvidiaThermalOptions::is_empty")]
     pub nvidia_thermal_options: NvidiaThermalOptions,
+    /// None restores managed fields; an empty Some opts in without requesting writes.
+    #[serde(default)]
+    pub nvidia_rail_controls: Option<NvidiaRailControls>,
     pub power_mizer_mode: Option<PowerMizerMode>,
     pub power_cap: Option<f64>,
     #[serde(default, skip_serializing_if = "NvidiaPowerCapMode::is_default")]

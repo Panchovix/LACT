@@ -801,6 +801,7 @@ impl GpuController for AmdGpuController {
                 link_info,
                 drm_info,
                 flags,
+                nvidia_runtime: None,
             }
         })
     }

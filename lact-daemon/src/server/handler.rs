@@ -45,13 +45,13 @@ use std::{
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     rc::Rc,
-    sync::LazyLock,
+    sync::{Arc, LazyLock},
     time::{Duration, Instant},
 };
 use tokio::{
     process::Command,
     select,
-    sync::{RwLock, RwLockReadGuard, mpsc, oneshot},
+    sync::{Mutex, OwnedMutexGuard, RwLock, RwLockReadGuard, mpsc, oneshot},
     task::JoinHandle,
     time::sleep,
 };
@@ -97,11 +97,25 @@ mod polkit_actions {
 type ProfileHolds = Rc<RefCell<Vec<(u64, Rc<str>, mpsc::Sender<()>)>>>;
 type ProfileHoldSnapshot = Rc<RefCell<Option<(Option<Rc<str>>, bool)>>>;
 
+enum GpuConfigReset {
+    Clocks,
+    Pmfw,
+}
+
+struct GpuConfigChange {
+    id: String,
+    previous_config: Option<GpuConfig>,
+    new_config: GpuConfig,
+    apply_timer: u64,
+    reset: Option<GpuConfigReset>,
+}
+
 #[derive(Clone)]
 pub struct Handler {
     pub config: Rc<RwLock<Config>>,
     gpu_controllers: Rc<RwLock<BTreeMap<String, DynGpuController>>>,
     confirm_config_tx: Rc<RefCell<Option<oneshot::Sender<ConfirmCommand>>>>,
+    config_operation: Arc<Mutex<()>>,
     pub config_last_saved: Rc<Cell<Instant>>,
     profile_watcher_tx: Rc<RefCell<Option<mpsc::Sender<ProfileWatcherCommand>>>>,
     pub profile_watcher_state: Rc<RefCell<Option<ProfileWatcherState>>>,
@@ -202,6 +216,7 @@ impl<'a> Handler {
             gpu_controllers: Rc::new(RwLock::new(controllers)),
             config: Rc::new(RwLock::new(config)),
             confirm_config_tx: Rc::new(RefCell::new(None)),
+            config_operation: Arc::new(Mutex::new(())),
             config_last_saved: Rc::new(Cell::new(Instant::now())),
             profile_watcher_tx: Rc::new(RefCell::new(None)),
             profile_watcher_state: Rc::new(RefCell::new(None)),
@@ -240,9 +255,38 @@ impl<'a> Handler {
     }
 
     pub async fn apply_current_config(&self) -> anyhow::Result<()> {
+        let _operation = self.try_config_operation()?;
+        self.apply_current_config_inner().await
+    }
+
+    fn try_config_operation(&self) -> anyhow::Result<OwnedMutexGuard<()>> {
+        self.config_operation.clone().try_lock_owned().map_err(|_| {
+            anyhow!(
+                "There is a configuration operation or unconfirmed configuration change pending"
+            )
+        })
+    }
+
+    async fn apply_current_config_inner(&self) -> anyhow::Result<()> {
         let config = self.config.read().await;
         let controllers = self.gpu_controllers.read().await;
         apply_config_to_controllers(&controllers, &config).await
+    }
+
+    /// A deferred snapshot is saved again because confirmation may have overwritten its file.
+    pub(crate) async fn reload_config(&self, new_config: Config) -> anyhow::Result<()> {
+        let (_operation, deferred) = match self.config_operation.clone().try_lock_owned() {
+            Ok(operation) => (operation, false),
+            Err(_) => (self.config_operation.clone().lock_owned().await, true),
+        };
+        {
+            let mut config = self.config.write().await;
+            *config = new_config;
+            if deferred {
+                config.save(&self.config_last_saved)?;
+            }
+        }
+        self.apply_current_config_inner().await
     }
 
     pub async fn notify_reload_gpus(&self, accum_interval: Duration) {
@@ -250,6 +294,11 @@ impl<'a> Handler {
     }
 
     async fn reload_gpus(&self) {
+        let _operation = self.config_operation.clone().lock_owned().await;
+        self.reload_gpus_inner().await;
+    }
+
+    async fn reload_gpus_inner(&self) {
         let mut controllers_guard = self.gpu_controllers.write().await;
         let config = self.config.read().await;
         let detached_ids = self.ignored_gpu_ids.read().await;
@@ -264,8 +313,15 @@ impl<'a> Handler {
                 );
 
                 for old_controller in controllers_guard.values() {
+                    if let Err(err) = old_controller.prepare_reset().await {
+                        error!("could not recover controller before reload: {err:#}");
+                        continue;
+                    }
+                    if let Err(err) = old_controller.reset_clocks() {
+                        error!("could not reset clocks before controller cleanup: {err:#}");
+                        continue;
+                    }
                     old_controller.cleanup().await;
-                    let _ = old_controller.reset_clocks();
                 }
 
                 *controllers_guard = new_controllers;
@@ -295,6 +351,11 @@ impl<'a> Handler {
     }
 
     pub async fn start_profile_watcher(&self) {
+        let _operation = self.config_operation.clone().lock_owned().await;
+        self.start_profile_watcher_inner().await;
+    }
+
+    async fn start_profile_watcher_inner(&self) {
         self.stop_profile_watcher().await;
 
         let (profile_watcher_tx, profile_watcher_rx) = mpsc::channel(5);
@@ -310,43 +371,101 @@ impl<'a> Handler {
         id: String,
         f: F,
     ) -> anyhow::Result<u64> {
-        if self
-            .confirm_config_tx
-            .try_borrow_mut()
-            .map_err(|err| anyhow!("{err}"))?
-            .is_some()
-        {
-            return Err(anyhow!(
-                "There is an unconfirmed configuration change pending"
-            ));
-        }
+        let operation = self.try_config_operation()?;
+        self.edit_gpu_config_reserved(id, f, operation).await
+    }
 
+    async fn edit_gpu_config_reserved<F: FnOnce(&mut GpuConfig)>(
+        &self,
+        id: String,
+        f: F,
+        operation: OwnedMutexGuard<()>,
+    ) -> anyhow::Result<u64> {
+        self.edit_gpu_config_prepared(id, f, operation, None).await
+    }
+
+    async fn edit_gpu_config_prepared<F: FnOnce(&mut GpuConfig)>(
+        &self,
+        id: String,
+        f: F,
+        operation: OwnedMutexGuard<()>,
+        reset: Option<GpuConfigReset>,
+    ) -> anyhow::Result<u64> {
         let (previous_config, apply_timer) = {
             let config = self.config.read().await;
             let apply_timer = config.apply_settings_timer;
-            let gpu_config = config.gpus()?.get(&id).cloned().unwrap_or_default();
+            let gpu_config = config.gpus()?.get(&id).cloned();
             (gpu_config, apply_timer)
         };
 
-        let mut new_config = previous_config.clone();
+        let mut new_config = previous_config.clone().unwrap_or_default();
         f(&mut new_config);
 
+        // Once native application begins, an RPC cancellation must not release ownership.
+        let handler = self.clone();
+        let (tx, rx) = oneshot::channel();
+        tokio::task::spawn_local(async move {
+            let result = handler
+                .apply_config_change(
+                    GpuConfigChange {
+                        id,
+                        previous_config,
+                        new_config,
+                        apply_timer,
+                        reset,
+                    },
+                    operation,
+                )
+                .await;
+            let _ = tx.send(result);
+        });
+        rx.await
+            .context("Configuration operation was interrupted")?
+    }
+
+    async fn apply_config_change(
+        &self,
+        change: GpuConfigChange,
+        operation: OwnedMutexGuard<()>,
+    ) -> anyhow::Result<u64> {
+        let GpuConfigChange {
+            id,
+            previous_config,
+            new_config,
+            apply_timer,
+            reset,
+        } = change;
         let controller = self.controller_by_id(&id).await?;
 
-        match controller.apply_config(&new_config).await {
+        let result = async {
+            if reset.is_some() {
+                controller.prepare_reset().await?;
+            }
+            match reset {
+                Some(GpuConfigReset::Clocks) => controller.reset_clocks()?,
+                Some(GpuConfigReset::Pmfw) => controller.reset_pmfw_settings(),
+                None => (),
+            }
+            controller.apply_config(&new_config).await
+        }
+        .await;
+        match result {
             Ok(()) => {
                 self.config
                     .write()
                     .await
                     .gpus_mut()?
                     .insert(id.clone(), new_config);
-                self.wait_config_confirm(id, previous_config, apply_timer)?;
+                self.wait_config_confirm(id, previous_config, apply_timer, operation);
 
                 Ok(apply_timer)
             }
             Err(apply_err) => {
                 error!("could not apply settings: {apply_err:?}");
-                match controller.apply_config(&previous_config).await {
+                match controller
+                    .apply_config(&previous_config.unwrap_or_default())
+                    .await
+                {
                     Ok(()) => Err(apply_err.context("Could not apply settings")),
                     Err(err) => Err(apply_err.context(err.context(
                         "Could not apply settings, and could not reset to previous settings",
@@ -360,66 +479,62 @@ impl<'a> Handler {
     fn wait_config_confirm(
         &self,
         id: String,
-        previous_config: GpuConfig,
+        previous_config: Option<GpuConfig>,
         apply_timer: u64,
-    ) -> anyhow::Result<()> {
+        operation: OwnedMutexGuard<()>,
+    ) {
         let (tx, rx) = oneshot::channel();
-        *self
-            .confirm_config_tx
-            .try_borrow_mut()
-            .map_err(|err| anyhow!("{err}"))? = Some(tx);
+        *self.confirm_config_tx.borrow_mut() = Some(tx);
 
         let handler = self.clone();
 
         tokio::task::spawn_local(async move {
-            let controller = handler
-                .controller_by_id(&id)
-                .await
-                .expect("GPU controller disappeared");
-
-            tokio::select! {
+            let confirm = tokio::select! {
                 () = tokio::time::sleep(Duration::from_secs(apply_timer)) => {
                     info!("no confirmation received, reverting settings");
+                    false
+                }
+                result = rx => matches!(result, Ok(ConfirmCommand::Confirm)),
+            };
 
-                    let mut config_guard = handler.config.write().await;
-                    match config_guard.gpus_mut() {
-                        Ok(gpus) => {
-                            gpus.insert(id, previous_config.clone());
-                        }
-                        Err(err) => {
-                            error!("could not revert config: {err}") ;
-                        }
-                    }
-
-                    if let Err(err) = controller.apply_config(&previous_config).await {
-                        error!("could not revert settings: {err:#}");
+            let saved = if confirm {
+                info!("saving updated config");
+                match handler.config.read().await.save(&handler.config_last_saved) {
+                    Ok(()) => true,
+                    Err(err) => {
+                        error!("could not save updated config, reverting: {err:#}");
+                        false
                     }
                 }
-                result = rx => {
-                    match result {
-                        Ok(ConfirmCommand::Confirm) => {
-                            info!("saving updated config");
+            } else {
+                false
+            };
 
-                            if let Err(err) = handler.config.read().await.save(&handler.config_last_saved) {
-                                error!("{err:#}");
+            if !saved {
+                {
+                    let mut config_guard = handler.config.write().await;
+                    match config_guard.gpus_mut() {
+                        Ok(gpus) => match &previous_config {
+                            Some(config) => {
+                                gpus.insert(id.clone(), config.clone());
                             }
-                        }
-                        Ok(ConfirmCommand::Revert) | Err(_) => {
-                            let mut config_guard = handler.config.write().await;
-                            match config_guard.gpus_mut() {
-                                Ok(gpus) => {
-                                    gpus.insert(id, previous_config.clone());
-                                }
-                                Err(err) => {
-                                    error!("could not revert config: {err}") ;
-                                }
+                            None => {
+                                gpus.shift_remove(&id);
                             }
-
-                            if let Err(err) = controller.apply_config(&previous_config).await {
-                                error!("could not revert settings: {err:#}");
-                            }
+                        },
+                        Err(err) => error!("could not revert config: {err}"),
+                    }
+                }
+                match handler.controller_by_id(&id).await {
+                    Ok(controller) => {
+                        if let Err(err) = controller
+                            .apply_config(&previous_config.unwrap_or_default())
+                            .await
+                        {
+                            error!("could not revert settings: {err:#}");
                         }
                     }
+                    Err(err) => error!("could not find controller during revert: {err:#}"),
                 }
             }
 
@@ -427,9 +542,8 @@ impl<'a> Handler {
                 Ok(mut guard) => *guard = None,
                 Err(err) => error!("{err}"),
             }
+            drop(operation);
         });
-
-        Ok(())
     }
 
     async fn controller_by_id(
@@ -516,12 +630,14 @@ impl<'a> Handler {
     }
 
     pub async fn set_fan_control(&'a self, opts: FanOptions<'_>) -> anyhow::Result<u64> {
+        let operation = self.try_config_operation()?;
         let settings = {
-            let mut config_guard = self.config.write().await;
+            let config_guard = self.config.read().await;
             let gpu_config = config_guard
-                .gpus_mut()?
-                .entry(opts.id.to_owned())
-                .or_default();
+                .gpus()?
+                .get(opts.id)
+                .cloned()
+                .unwrap_or_default();
 
             match opts.mode {
                 Some(mode) => match mode {
@@ -582,24 +698,32 @@ impl<'a> Handler {
             }
         };
 
-        self.edit_gpu_config(opts.id.to_owned(), |config| {
-            config.fan_control_enabled = opts.enabled;
-            if let Some(settings) = settings {
-                config.fan_control_settings = Some(settings);
-            }
-            config.pmfw_options = opts.pmfw;
-        })
+        self.edit_gpu_config_reserved(
+            opts.id.to_owned(),
+            |config| {
+                config.fan_control_enabled = opts.enabled;
+                if let Some(settings) = settings {
+                    config.fan_control_settings = Some(settings);
+                }
+                config.pmfw_options = opts.pmfw;
+            },
+            operation,
+        )
         .await
         .context("Failed to edit GPU config")
     }
 
     pub async fn reset_pmfw(&self, id: &str) -> anyhow::Result<u64> {
+        let operation = self.try_config_operation()?;
         info!("Resetting PMFW settings");
-        self.controller_by_id(id).await?.reset_pmfw_settings();
-
-        self.edit_gpu_config(id.to_owned(), |config| {
-            config.pmfw_options = PmfwOptions::default();
-        })
+        self.edit_gpu_config_prepared(
+            id.to_owned(),
+            |config| {
+                config.pmfw_options = PmfwOptions::default();
+            },
+            operation,
+            Some(GpuConfigReset::Pmfw),
+        )
         .await
         .context("Failed to edit GPU config and reset pmfw")
     }
@@ -644,15 +768,20 @@ impl<'a> Handler {
         id: &str,
         command: SetClocksCommand,
     ) -> anyhow::Result<u64> {
-        if let ClockspeedType::Reset = command.r#type {
-            self.controller_by_id(id).await?.reset_clocks()?;
-        }
+        let operation = self.try_config_operation()?;
+        let reset =
+            matches!(command.r#type, ClockspeedType::Reset).then_some(GpuConfigReset::Clocks);
 
-        self.edit_gpu_config(id.to_owned(), |gpu_config| {
-            gpu_config
-                .clocks_configuration
-                .apply_clocks_command(&command);
-        })
+        self.edit_gpu_config_prepared(
+            id.to_owned(),
+            |gpu_config| {
+                gpu_config
+                    .clocks_configuration
+                    .apply_clocks_command(&command);
+            },
+            operation,
+            reset,
+        )
         .await
         .context("Failed to edit GPU config and set clocks value")
     }
@@ -895,14 +1024,15 @@ impl<'a> Handler {
         name: Option<Rc<str>>,
         auto_switch: bool,
     ) -> anyhow::Result<()> {
+        let _operation = self.try_config_operation()?;
         if !self.profile_holds.borrow().is_empty() {
             bail!("Cannot change profile while a hold is active");
         }
         if auto_switch {
-            self.start_profile_watcher().await;
+            self.start_profile_watcher_inner().await;
         } else {
             self.stop_profile_watcher().await;
-            self.set_current_profile(name).await?;
+            self.set_current_profile_inner(name).await?;
         }
 
         let mut config = self.config.write().await;
@@ -913,6 +1043,11 @@ impl<'a> Handler {
     }
 
     pub(super) async fn set_current_profile(&self, name: Option<Rc<str>>) -> anyhow::Result<()> {
+        let _operation = self.try_config_operation()?;
+        self.set_current_profile_inner(name).await
+    }
+
+    async fn set_current_profile_inner(&self, name: Option<Rc<str>>) -> anyhow::Result<()> {
         let mut activation_hook = None;
         let mut deactivation_hook = None;
         {
@@ -930,10 +1065,10 @@ impl<'a> Handler {
             }
         }
 
-        self.cleanup().await;
+        self.cleanup_inner().await;
         self.config.write().await.current_profile = name;
 
-        self.apply_current_config().await?;
+        self.apply_current_config_inner().await?;
 
         if let Some(deactivated) = &deactivation_hook {
             run_hook_command(deactivated).await?;
@@ -951,6 +1086,7 @@ impl<'a> Handler {
         base: ProfileBase,
         ctx: &ClientContext,
     ) -> anyhow::Result<()> {
+        let _operation = self.try_config_operation()?;
         {
             let mut config = self.config.write().await;
             if config.profiles.contains_key(name.as_str()) {
@@ -987,6 +1123,7 @@ impl<'a> Handler {
     }
 
     pub async fn delete_profile(&self, name: String) -> anyhow::Result<()> {
+        let _operation = self.try_config_operation()?;
         if self
             .profile_holds
             .borrow()
@@ -996,7 +1133,7 @@ impl<'a> Handler {
             bail!("Cannot delete profile '{name}' while it is held");
         }
         if self.config.read().await.current_profile.as_deref() == Some(&name) {
-            self.set_current_profile(None).await?;
+            self.set_current_profile_inner(None).await?;
         }
         self.config
             .write()
@@ -1015,6 +1152,7 @@ impl<'a> Handler {
     }
 
     pub async fn move_profile(&self, name: &str, new_position: usize) -> anyhow::Result<()> {
+        let _operation = self.try_config_operation()?;
         {
             let mut config = self.config.write().await;
 
@@ -1046,6 +1184,7 @@ impl<'a> Handler {
         hooks: ProfileHooks,
         ctx: &ClientContext,
     ) -> anyhow::Result<()> {
+        let _operation = self.try_config_operation()?;
         if !hooks.is_empty() {
             self.check_auth(
                 polkit_actions::PROFILE_HOOK,
@@ -1101,17 +1240,19 @@ impl<'a> Handler {
     }
 
     pub async fn detach_gpu(&self, gpu_id: &str) -> anyhow::Result<()> {
+        let _operation = self.try_config_operation()?;
         let _ = self.controller_by_id(gpu_id).await?;
 
         self.ignored_gpu_ids.write().await.push(gpu_id.to_owned());
-        self.reload_gpus().await;
+        self.reload_gpus_inner().await;
 
         Ok(())
     }
 
     pub async fn reattach_gpu(&self, gpu_id: &str) -> anyhow::Result<()> {
+        let _operation = self.try_config_operation()?;
         self.ignored_gpu_ids.write().await.retain(|id| id != gpu_id);
-        self.reload_gpus().await;
+        self.reload_gpus_inner().await;
 
         let _ = self.controller_by_id(gpu_id).await?;
 
@@ -1137,6 +1278,7 @@ impl<'a> Handler {
         name: String,
         disconnect_notify: std::sync::Arc<tokio::sync::Notify>,
     ) -> anyhow::Result<u64> {
+        let _operation = self.try_config_operation()?;
         {
             let config = self.config.read().await;
             config.profile(&name)?;
@@ -1164,7 +1306,7 @@ impl<'a> Handler {
             .borrow_mut()
             .push((cookie, name_rc.clone(), release_tx));
 
-        if let Err(err) = self.set_current_profile(Some(name_rc)).await {
+        if let Err(err) = self.set_current_profile_inner(Some(name_rc)).await {
             self.profile_holds
                 .borrow_mut()
                 .retain(|(c, _, _)| *c != cookie);
@@ -1195,6 +1337,7 @@ impl<'a> Handler {
     }
 
     pub async fn release_profile(&self, cookie: u64) -> anyhow::Result<()> {
+        let _operation = self.config_operation.clone().lock_owned().await;
         let (idx, was_top) = {
             let holds = self.profile_holds.borrow();
             match holds.iter().rposition(|(c, _, _)| *c == cookie) {
@@ -1216,10 +1359,10 @@ impl<'a> Handler {
                 .take()
                 .expect("snapshot missing while holds were active");
 
-            self.set_current_profile(profile).await?;
+            self.set_current_profile_inner(profile).await?;
 
             if auto_switch {
-                self.start_profile_watcher().await;
+                self.start_profile_watcher_inner().await;
             }
 
             let mut config = self.config.write().await;
@@ -1233,14 +1376,15 @@ impl<'a> Handler {
                 .last()
                 .map(|(_, name, _)| name.clone())
                 .unwrap();
-            self.set_current_profile(Some(target)).await?;
+            self.set_current_profile_inner(Some(target)).await?;
         }
 
         Ok(())
     }
 
     pub async fn reset_config(&self) {
-        self.cleanup().await;
+        let _operation = self.config_operation.clone().lock_owned().await;
+        self.cleanup_inner().await;
 
         let mut config = self.config.write().await;
         config.clear();
@@ -1251,14 +1395,24 @@ impl<'a> Handler {
     }
 
     pub async fn cleanup(&self) {
+        let _operation = self.config_operation.clone().lock_owned().await;
+        self.cleanup_inner().await;
+    }
+
+    async fn cleanup_inner(&self) {
         let disable_clocks_cleanup = self.config.read().await.daemon.disable_clocks_cleanup;
 
         let controllers = self.gpu_controllers.read().await;
         for (id, controller) in controllers.iter() {
+            if let Err(err) = controller.prepare_reset().await {
+                error!("could not recover controller {id} before cleanup: {err:#}");
+                continue;
+            }
             if !disable_clocks_cleanup {
                 debug!("resetting clocks table");
                 if let Err(err) = controller.reset_clocks() {
                     error!("could not reset the clocks table: {err}");
+                    continue;
                 }
             }
 
@@ -1327,17 +1481,32 @@ async fn apply_config_to_controllers(
     config: &Config,
 ) -> anyhow::Result<()> {
     let gpus = config.gpus()?;
-    for (id, gpu_config) in gpus {
-        if let Some(controller) = controllers.get(id) {
+    let mut failures = Vec::new();
+    for (id, controller) in controllers {
+        let result = if let Some(gpu_config) = gpus.get(id) {
             debug!("applying config {gpu_config:#?} to controller {id}");
-            if let Err(err) = controller.apply_config(gpu_config).await {
-                error!("could not apply existing config for gpu {id}: {err:#}");
-            }
+            controller.apply_config(gpu_config).await
         } else {
+            // A removed GPU/profile entry still releases externally managed
+            // controls, without resetting its unrelated GPU settings.
+            controller.restore_runtime_controls().await
+        };
+        if let Err(err) = result {
+            error!("could not reconcile config for gpu {id}: {err:#}");
+            failures.push(format!("{id}: {err:#}"));
+        }
+    }
+    for id in gpus.keys() {
+        if !controllers.contains_key(id) {
             warn!("could not find GPU with id {id} defined in configuration");
         }
     }
-
+    if !failures.is_empty() {
+        bail!(
+            "Could not reconcile GPU configuration: {}",
+            failures.join("; ")
+        );
+    }
     Ok(())
 }
 
@@ -1638,5 +1807,539 @@ async fn handle_reload_events(handler: Handler, mut rx: mpsc::Receiver<Duration>
 
         info!("got reload event, reloading GPUs");
         handler.reload_gpus().await;
+    }
+}
+
+#[cfg(test)]
+mod runtime_config_reconciliation_tests {
+    use super::*;
+    use crate::server::gpu_controller::CommonControllerInfo;
+    use futures::{FutureExt, future::LocalBoxFuture};
+    use lact_schema::DeviceType;
+
+    #[derive(Debug, PartialEq)]
+    enum Call {
+        Apply(&'static str, Option<f64>),
+        Restore(&'static str),
+    }
+
+    struct RecordingController {
+        name: &'static str,
+        calls: Rc<RefCell<Vec<Call>>>,
+        fail: bool,
+        gate: Option<Rc<ApplyGate>>,
+    }
+
+    struct ApplyGate {
+        started: mpsc::UnboundedSender<Option<f64>>,
+        permits: tokio::sync::Semaphore,
+    }
+
+    impl GpuController for RecordingController {
+        fn controller_type(&self) -> &'static str {
+            "test"
+        }
+        fn controller_info(&self) -> &CommonControllerInfo {
+            unreachable!()
+        }
+        fn device_type(&self) -> DeviceType {
+            unreachable!()
+        }
+        fn get_info(&self, _: bool, _: bool) -> LocalBoxFuture<'_, DeviceInfo> {
+            unreachable!()
+        }
+        fn friendly_name(&self) -> Option<String> {
+            None
+        }
+        fn apply_config<'a>(
+            &'a self,
+            config: &'a GpuConfig,
+        ) -> LocalBoxFuture<'a, anyhow::Result<()>> {
+            async move {
+                self.calls
+                    .borrow_mut()
+                    .push(Call::Apply(self.name, config.power_cap));
+                if let Some(gate) = &self.gate {
+                    gate.started.send(config.power_cap).unwrap();
+                    gate.permits.acquire().await.unwrap().forget();
+                }
+                if self.fail {
+                    bail!("synthetic apply failure");
+                }
+                Ok(())
+            }
+            .boxed_local()
+        }
+        fn restore_runtime_controls(&self) -> LocalBoxFuture<'_, anyhow::Result<()>> {
+            async move {
+                self.calls.borrow_mut().push(Call::Restore(self.name));
+                if self.fail {
+                    bail!("synthetic restore failure");
+                }
+                Ok(())
+            }
+            .boxed_local()
+        }
+        fn get_stats(&self, _: Option<&GpuConfig>) -> DeviceStats {
+            unreachable!()
+        }
+        fn get_clocks_info(&self, _: Option<&GpuConfig>) -> anyhow::Result<ClocksInfo> {
+            unreachable!()
+        }
+        fn get_power_states(&self, _: Option<&GpuConfig>) -> PowerStates {
+            unreachable!()
+        }
+        fn reset_clocks(&self) -> anyhow::Result<()> {
+            panic!("unrelated clock reset is forbidden")
+        }
+        fn get_power_profile_modes(&self) -> anyhow::Result<PowerProfileModesTable> {
+            unreachable!()
+        }
+        fn vbios_dump(&self) -> anyhow::Result<Vec<u8>> {
+            unreachable!()
+        }
+        fn process_list(&self) -> anyhow::Result<ProcessList> {
+            unreachable!()
+        }
+    }
+
+    fn controllers(
+        calls: &Rc<RefCell<Vec<Call>>>,
+        entries: &[(&'static str, bool)],
+    ) -> BTreeMap<String, Box<dyn GpuController>> {
+        entries
+            .iter()
+            .map(|(name, fail)| {
+                (
+                    (*name).to_owned(),
+                    Box::new(RecordingController {
+                        name,
+                        calls: calls.clone(),
+                        fail: *fail,
+                        gate: None,
+                    }) as Box<dyn GpuController>,
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn omitted_gpu_releases_runtime_without_applying_default_clock_settings() {
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let controllers = controllers(&calls, &[("configured", false), ("omitted", false)]);
+        let mut config = Config::default();
+        config.gpus_mut().unwrap().insert(
+            "configured".into(),
+            GpuConfig {
+                power_cap: Some(123.0),
+                ..Default::default()
+            },
+        );
+        apply_config_to_controllers(&controllers, &config)
+            .await
+            .unwrap();
+        assert_eq!(
+            *calls.borrow(),
+            vec![
+                Call::Apply("configured", Some(123.0)),
+                Call::Restore("omitted")
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn reconciliation_attempts_all_gpus_and_reports_restore_and_apply_failures() {
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let controllers = controllers(&calls, &[("a", true), ("b", true), ("c", false)]);
+        let mut config = Config::default();
+        config
+            .gpus_mut()
+            .unwrap()
+            .insert("b".into(), GpuConfig::default());
+        let error = apply_config_to_controllers(&controllers, &config)
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("a: synthetic restore failure"));
+        assert!(message.contains("b: synthetic apply failure"));
+        assert_eq!(
+            *calls.borrow(),
+            vec![
+                Call::Restore("a"),
+                Call::Apply("b", None),
+                Call::Restore("c")
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn active_profile_omission_restores_even_if_default_profile_contains_gpu() {
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let controllers = controllers(&calls, &[("gpu", false)]);
+        let mut config = Config::default();
+        config
+            .gpus_mut()
+            .unwrap()
+            .insert("gpu".into(), GpuConfig::default());
+        config
+            .profiles
+            .insert(Rc::from("empty"), Profile::default());
+        config.current_profile = Some(Rc::from("empty"));
+        apply_config_to_controllers(&controllers, &config)
+            .await
+            .unwrap();
+        assert_eq!(*calls.borrow(), vec![Call::Restore("gpu")]);
+    }
+
+    fn handler_with_gate(
+        fail: bool,
+        apply_timer: u64,
+    ) -> (Handler, Rc<ApplyGate>, mpsc::UnboundedReceiver<Option<f64>>) {
+        let (started, rx) = mpsc::unbounded_channel();
+        let gate = Rc::new(ApplyGate {
+            started,
+            permits: tokio::sync::Semaphore::new(0),
+        });
+        let controller = RecordingController {
+            name: "gpu",
+            calls: Rc::default(),
+            fail,
+            gate: Some(gate.clone()),
+        };
+        let mut config = Config::default();
+        config.apply_settings_timer = apply_timer;
+        config.daemon.disable_clocks_cleanup = true;
+        config.gpus_mut().unwrap().insert(
+            "gpu".into(),
+            GpuConfig {
+                power_cap: Some(100.0),
+                ..GpuConfig::default()
+            },
+        );
+        config
+            .profiles
+            .insert(Rc::from("other"), Profile::default());
+        let handler = Handler {
+            config: Rc::new(RwLock::new(config)),
+            gpu_controllers: Rc::new(RwLock::new(BTreeMap::from([(
+                "gpu".into(),
+                Box::new(controller) as DynGpuController,
+            )]))),
+            confirm_config_tx: Rc::new(RefCell::new(None)),
+            config_operation: Arc::new(Mutex::new(())),
+            config_last_saved: Rc::new(Cell::new(Instant::now())),
+            profile_watcher_tx: Rc::default(),
+            profile_watcher_state: Rc::default(),
+            profile_watcher_join_handle: Rc::default(),
+            profile_holds: Rc::default(),
+            profile_hold_snapshot: Rc::default(),
+            next_hold_cookie: Rc::new(Cell::new(1)),
+            polkit_proxy: None,
+            ignored_gpu_ids: Rc::new(RwLock::new(vec![])),
+            reload_tx: Rc::new(mpsc::channel(1).0),
+        };
+        (handler, gate, rx)
+    }
+
+    fn gpu_config(cap: f64) -> GpuConfig {
+        GpuConfig {
+            power_cap: Some(cap),
+            ..GpuConfig::default()
+        }
+    }
+
+    async fn settled(handler: &Handler) {
+        drop(handler.config_operation.clone().lock_owned().await);
+    }
+
+    #[tokio::test]
+    async fn edit_reserves_before_first_await_and_rejects_parallel_rpc() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (handler, gate, mut starts) = handler_with_gate(false, 120);
+                let config_write = handler.config.write().await;
+                let mut first = Box::pin(handler.set_gpu_config("gpu", gpu_config(200.0)));
+                assert!(futures::poll!(first.as_mut()).is_pending());
+                assert!(
+                    handler
+                        .set_gpu_config("gpu", gpu_config(300.0))
+                        .await
+                        .is_err()
+                );
+                assert!(
+                    handler
+                        .set_current_profile(Some(Rc::from("other")))
+                        .await
+                        .is_err()
+                );
+                assert!(starts.try_recv().is_err());
+                drop(config_write);
+                let (result, ()) = tokio::join!(first, async {
+                    assert_eq!(starts.recv().await.unwrap(), Some(200.0));
+                    gate.permits.add_permits(1);
+                });
+                result.unwrap();
+                handler
+                    .confirm_pending_config(ConfirmCommand::Confirm)
+                    .unwrap();
+                assert!(
+                    handler
+                        .set_gpu_config("gpu", gpu_config(300.0))
+                        .await
+                        .is_err()
+                );
+                settled(&handler).await;
+                assert_eq!(
+                    handler
+                        .get_gpu_config("gpu")
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .power_cap,
+                    Some(200.0)
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn consumed_confirmation_keeps_reservation_through_revert_and_old_cleanup() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (handler, gate, mut starts) = handler_with_gate(false, 120);
+                gate.permits.add_permits(1);
+                handler
+                    .set_gpu_config("gpu", gpu_config(200.0))
+                    .await
+                    .unwrap();
+                assert_eq!(starts.recv().await.unwrap(), Some(200.0));
+                handler
+                    .confirm_pending_config(ConfirmCommand::Revert)
+                    .unwrap();
+                assert_eq!(starts.recv().await.unwrap(), Some(100.0));
+                assert!(handler.confirm_config_tx.borrow().is_none());
+                assert!(
+                    handler
+                        .set_gpu_config("gpu", gpu_config(300.0))
+                        .await
+                        .is_err()
+                );
+                assert!(
+                    handler
+                        .set_profile(Some(Rc::from("other")), false)
+                        .await
+                        .is_err()
+                );
+                assert!(handler.delete_profile("other".into()).await.is_err());
+                assert!(handler.detach_gpu("gpu").await.is_err());
+                assert!(handler.reset_pmfw("gpu").await.is_err());
+                assert!(handler.config.read().await.current_profile.is_none());
+                gate.permits.add_permits(1);
+                settled(&handler).await;
+                gate.permits.add_permits(1);
+                handler
+                    .set_gpu_config("gpu", gpu_config(300.0))
+                    .await
+                    .unwrap();
+                assert_eq!(starts.recv().await.unwrap(), Some(300.0));
+                assert!(handler.confirm_config_tx.borrow().is_some());
+                handler
+                    .confirm_pending_config(ConfirmCommand::Confirm)
+                    .unwrap();
+                settled(&handler).await;
+                assert_eq!(
+                    handler
+                        .get_gpu_config("gpu")
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .power_cap,
+                    Some(300.0)
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn failed_apply_keeps_reservation_until_failed_rollback_finishes() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (handler, gate, mut starts) = handler_with_gate(true, 120);
+                let task_handler = handler.clone();
+                let edit = tokio::task::spawn_local(async move {
+                    task_handler.set_gpu_config("gpu", gpu_config(200.0)).await
+                });
+                assert_eq!(starts.recv().await.unwrap(), Some(200.0));
+                gate.permits.add_permits(1);
+                assert_eq!(starts.recv().await.unwrap(), Some(100.0));
+                assert!(
+                    handler
+                        .set_gpu_config("gpu", gpu_config(300.0))
+                        .await
+                        .is_err()
+                );
+                gate.permits.add_permits(1);
+                assert!(edit.await.unwrap().is_err());
+                assert!(handler.try_config_operation().is_ok());
+                assert_eq!(
+                    handler
+                        .get_gpu_config("gpu")
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .power_cap,
+                    Some(100.0)
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_rpc_keeps_worker_and_reservation_until_timeout_rollback_finishes() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (handler, gate, mut starts) = handler_with_gate(false, 0);
+                let task_handler = handler.clone();
+                let edit = tokio::task::spawn_local(async move {
+                    task_handler.set_gpu_config("gpu", gpu_config(200.0)).await
+                });
+                assert_eq!(starts.recv().await.unwrap(), Some(200.0));
+                edit.abort();
+                assert!(edit.await.unwrap_err().is_cancelled());
+                assert!(
+                    handler
+                        .set_gpu_config("gpu", gpu_config(300.0))
+                        .await
+                        .is_err()
+                );
+                gate.permits.add_permits(1);
+                assert_eq!(starts.recv().await.unwrap(), Some(100.0));
+                assert!(
+                    handler
+                        .set_gpu_config("gpu", gpu_config(300.0))
+                        .await
+                        .is_err()
+                );
+                gate.permits.add_permits(1);
+                settled(&handler).await;
+                assert_eq!(
+                    handler
+                        .get_gpu_config("gpu")
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .power_cap,
+                    Some(100.0)
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn config_file_reload_and_reset_wait_for_pending_transaction() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (handler, gate, mut starts) = handler_with_gate(false, 120);
+                gate.permits.add_permits(1);
+                handler
+                    .set_gpu_config("gpu", gpu_config(200.0))
+                    .await
+                    .unwrap();
+                starts.recv().await.unwrap();
+                let mut replacement = Config::default();
+                replacement
+                    .profiles
+                    .insert(Rc::from("other"), Profile::default());
+                replacement.current_profile = Some(Rc::from("other"));
+                let mut reload = Box::pin(handler.reload_config(replacement));
+                let mut reset = Box::pin(handler.reset_config());
+                assert!(futures::poll!(reload.as_mut()).is_pending());
+                assert!(futures::poll!(reset.as_mut()).is_pending());
+                assert!(handler.config.read().await.current_profile.is_none());
+                drop(reset);
+                handler
+                    .confirm_pending_config(ConfirmCommand::Revert)
+                    .unwrap();
+                assert_eq!(starts.recv().await.unwrap(), Some(100.0));
+                assert!(futures::poll!(reload.as_mut()).is_pending());
+                gate.permits.add_permits(1);
+                reload.await.unwrap();
+                assert_eq!(
+                    handler.config.read().await.current_profile.as_deref(),
+                    Some("other")
+                );
+                assert!(handler.confirm_config_tx.borrow().is_none());
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn reverting_first_gpu_config_removes_entry_and_restores_original() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (handler, gate, mut starts) = handler_with_gate(false, 120);
+                handler.config.write().await.gpus_mut().unwrap().clear();
+                gate.permits.add_permits(1);
+                handler
+                    .set_gpu_config("gpu", gpu_config(200.0))
+                    .await
+                    .unwrap();
+                starts.recv().await.unwrap();
+                handler
+                    .confirm_pending_config(ConfirmCommand::Revert)
+                    .unwrap();
+                assert_eq!(starts.recv().await.unwrap(), None);
+                gate.permits.add_permits(1);
+                settled(&handler).await;
+                assert!(handler.get_gpu_config("gpu").await.unwrap().is_none());
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn deferred_reload_resaves_admin_snapshot_after_old_confirmation() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (handler, gate, mut starts) = handler_with_gate(false, 120);
+                gate.permits.add_permits(1);
+                handler
+                    .set_gpu_config("gpu", gpu_config(200.0))
+                    .await
+                    .unwrap();
+                starts.recv().await.unwrap();
+                // Queue an observer before the reload to inspect the completed old save precisely.
+                let mut old_completed = Box::pin(handler.config_operation.clone().lock_owned());
+                assert!(futures::poll!(old_completed.as_mut()).is_pending());
+                let mut replacement = Config::default();
+                replacement
+                    .profiles
+                    .insert(Rc::from("other"), Profile::default());
+                replacement.current_profile = Some(Rc::from("other"));
+                let mut reload = Box::pin(handler.reload_config(replacement));
+                assert!(futures::poll!(reload.as_mut()).is_pending());
+                handler
+                    .confirm_pending_config(ConfirmCommand::Confirm)
+                    .unwrap();
+                let observer = old_completed.await;
+                let old_saved = handler.config_last_saved.get();
+                assert!(handler.confirm_config_tx.borrow().is_none());
+                assert!(handler.config.read().await.current_profile.is_none());
+                drop(observer);
+                reload.await.unwrap();
+                assert!(handler.config_last_saved.get() > old_saved);
+                assert_eq!(
+                    handler.config.read().await.current_profile.as_deref(),
+                    Some("other")
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn ordinary_reload_does_not_rewrite_observed_file() {
+        let (handler, _gate, _starts) = handler_with_gate(false, 120);
+        let previous_saved = handler.config_last_saved.get();
+        handler.reload_config(Config::default()).await.unwrap();
+        assert_eq!(handler.config_last_saved.get(), previous_saved);
     }
 }
