@@ -714,8 +714,18 @@ mod tests {
     pub(super) fn fake(body: &str, timeout_ms: u64) -> (TempDir, RuntimeControls) {
         let dir = tempfile::tempdir().unwrap();
         let executable = dir.path().join("fake-helper");
-        fs::write(&executable, format!("#!/usr/bin/python3\nimport sys,json,os,time\nr=json.load(sys.stdin)\nassert sys.argv[1:3] == ['lact-bridge','--state-dir']\nstate_dir=sys.argv[3]\n{body}\n")).unwrap();
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let source = dir.path().join("fake-helper.py");
+        fs::write(&source, format!("#!/usr/bin/python3\nimport sys,json,os,time\nr=json.load(sys.stdin)\nassert sys.argv[1:3] == ['lact-bridge','--state-dir']\nstate_dir=sys.argv[3]\n{body}\n")).unwrap();
+        // Another test's fork inherits our write descriptors until it execs, and
+        // executing a file still open for writing fails with ETXTBSY. A child
+        // process writes the executable, so this process never holds it open.
+        let installed = std::process::Command::new("install")
+            .arg("-m700")
+            .arg(&source)
+            .arg(&executable)
+            .status()
+            .unwrap();
+        assert!(installed.success());
         let runtime = RuntimeControls::new(
             NvidiaRuntimeHelperConfig {
                 executable,
