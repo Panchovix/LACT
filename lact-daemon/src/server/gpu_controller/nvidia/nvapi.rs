@@ -61,7 +61,9 @@ impl NvApi {
             let status = initialize();
             handle.handle_status(status)?;
 
-            handle.enum_physical_gpus().unwrap();
+            handle
+                .enum_physical_gpus()
+                .context("Could not enumerate physical NVIDIA GPUs")?;
         }
 
         Ok(handle)

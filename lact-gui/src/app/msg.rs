@@ -15,6 +15,7 @@ pub enum AppMsg {
         full: bool,
     },
     ReloadApiInfo,
+    RefreshNvidiaRuntime,
     Stats(Arc<DeviceStats>),
     ProfilesPolled(Arc<ProfilesInfo>),
     ApplyChanges,

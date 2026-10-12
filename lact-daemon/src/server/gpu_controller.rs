@@ -88,6 +88,16 @@ pub trait GpuController {
         async {}.boxed_local()
     }
 
+    /// Release persistent ownership even when this GPU has no saved configuration.
+    fn restore_runtime_controls(&self) -> LocalBoxFuture<'_, anyhow::Result<()>> {
+        async { Ok(()) }.boxed_local()
+    }
+
+    /// Finish helper recovery before an explicit reset touches clocks or boost.
+    fn prepare_reset(&self) -> LocalBoxFuture<'_, anyhow::Result<()>> {
+        async { Ok(()) }.boxed_local()
+    }
+
     fn reset_clocks(&self) -> anyhow::Result<()>;
 
     fn get_power_profile_modes(&self) -> anyhow::Result<PowerProfileModesTable>;
@@ -328,7 +338,12 @@ pub(crate) fn init_controller(
         #[cfg(feature = "nvidia")]
         "nvidia" => {
             if let Some(nvml) = nvml.clone() {
-                match NvidiaGpuController::new(common.clone(), nvml, nvapi.clone()) {
+                match NvidiaGpuController::new(
+                    common.clone(),
+                    nvml,
+                    nvapi.clone(),
+                    config.daemon.nvidia_runtime.clone(),
+                ) {
                     Ok(controller) => {
                         return Ok(Box::new(controller));
                     }

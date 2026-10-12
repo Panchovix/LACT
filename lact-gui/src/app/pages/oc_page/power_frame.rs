@@ -47,6 +47,7 @@ pub enum PowerSetting {
 
 pub struct PowerFrameSerialized {
     pub power_cap: Option<f64>,
+    pub power_cap_changed: bool,
     pub nvidia_power_cap_mode: Option<NvidiaPowerCapMode>,
     pub performance_level: Option<PerformanceLevel>,
     pub power_mizer_mode: Option<PowerMizerMode>,
@@ -56,10 +57,12 @@ pub struct PowerFrameSerialized {
 
 pub struct PowerFrame {
     power: PowerStats,
+    power_cap_changed: bool,
     nvidia_mode: Option<NvidiaPowerCapMode>,
     rows: FactoryHashMap<PowerSetting, SettingRow<PowerSetting>>,
     supported_power_mizer_modes: Vec<PowerMizerMode>,
     power_profile_mode: Option<Controller<AmdPowerProfileMode>>,
+    loaded_nvidia_mode: Option<NvidiaPowerCapMode>,
 }
 
 #[derive(Debug)]
@@ -145,6 +148,7 @@ impl relm4::Component for PowerFrame {
         let card = AdjustmentCard::init(());
         let model = Self {
             power: PowerStats::default(),
+            power_cap_changed: false,
             nvidia_mode: None,
             rows: FactoryHashMap::builder()
                 .launch(card.content.clone())
@@ -153,6 +157,7 @@ impl relm4::Component for PowerFrame {
                 }),
             supported_power_mizer_modes: Vec::new(),
             power_profile_mode: None,
+            loaded_nvidia_mode: None,
         };
         let widgets = view_output!();
 
@@ -185,6 +190,9 @@ impl relm4::Component for PowerFrame {
     ) {
         match msg {
             PowerFrameMsg::Stats(stats) => {
+                // OcPage forwards only initial stats when loading configuration.
+                // Periodic samples keep pending edits and their flags intact.
+                self.power_cap_changed = false;
                 self.rows.clear();
                 let power = &stats.power;
                 if let Some(value) = power.cap_current
@@ -272,7 +280,10 @@ impl relm4::Component for PowerFrame {
                 self.performance_level_changed(&sender);
             }
             // Config arrives before the initial stats rebuild; it is not a user edit.
-            PowerFrameMsg::NvidiaMode(mode) => self.nvidia_mode = mode,
+            PowerFrameMsg::NvidiaMode(mode) => {
+                self.nvidia_mode = mode;
+                self.loaded_nvidia_mode = mode;
+            }
             PowerFrameMsg::ToggleNvidiaIoctl(enabled) => {
                 let mode = if enabled {
                     NvidiaPowerCapMode::Ioctl
@@ -316,12 +327,17 @@ impl relm4::Component for PowerFrame {
                 });
             }
             PowerFrameMsg::SettingChanged(setting) => {
+                if setting == PowerSetting::PowerCap {
+                    self.power_cap_changed = true;
+                }
                 APP_BROKER.send(AppMsg::SettingsChanged);
                 if setting == PowerSetting::PerformanceLevel {
                     self.performance_level_changed(&sender);
                 }
             }
             PowerFrameMsg::Reset => {
+                // Reset is an explicit edit even when the displayed value is already default.
+                self.power_cap_changed = self.rows.get(&PowerSetting::PowerCap).is_some();
                 for setting in self.rows.keys() {
                     self.rows.send(setting, SettingRowMsg::Reset);
                 }
@@ -342,6 +358,7 @@ impl PowerFrame {
             .and_then(|power_profile_mode| power_profile_mode.model().serialize());
         PowerFrameSerialized {
             power_cap: value(PowerSetting::PowerCap).and_then(SettingRowValue::as_numeric),
+            power_cap_changed: self.power_cap_changed,
             nvidia_power_cap_mode: self.nvidia_power_cap_mode(),
             performance_level: selected(PowerSetting::PerformanceLevel)
                 .and_then(|index| PERFORMANCE_LEVELS.get(index as usize).copied()),
@@ -373,8 +390,11 @@ impl PowerFrame {
         }
     }
 
+    /// Export only a user change relative to the loaded configuration. Returning
+    /// to the loaded mode leaves a freshly fetched configuration untouched.
     pub fn nvidia_power_cap_mode(&self) -> Option<NvidiaPowerCapMode> {
-        self.nvidia_mode.filter(|_| self.nvidia_mode_available())
+        self.nvidia_mode
+            .filter(|_| self.nvidia_mode_available() && self.nvidia_mode != self.loaded_nvidia_mode)
     }
 
     fn selected(&self, setting: PowerSetting) -> Option<u32> {

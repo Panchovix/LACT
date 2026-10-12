@@ -5,6 +5,7 @@
 pub mod args;
 pub mod config;
 pub mod i18n;
+mod nvidia_runtime;
 mod profiles;
 pub mod request;
 mod response;
@@ -13,6 +14,7 @@ mod response;
 mod tests;
 
 use i18n_embed_fl::fl;
+pub use nvidia_runtime::*;
 pub use request::Request;
 pub use response::Response;
 
@@ -199,6 +201,8 @@ pub struct DeviceInfo {
     pub vbios_version: Option<String>,
     pub link_info: LinkInfo,
     pub drm_info: Option<DrmInfo>,
+    #[serde(default)]
+    pub nvidia_runtime: Option<NvidiaRuntimeInfo>,
     #[serde(default)]
     pub flags: Vec<DeviceFlag>,
 }
