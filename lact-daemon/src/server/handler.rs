@@ -441,6 +441,7 @@ impl<'a> Handler {
             reset,
         } = change;
         let controller = self.controller_by_id(&id).await?;
+        controller.note_previous_config(previous_config.as_ref().unwrap_or(&GpuConfig::default()));
 
         let result = async {
             if reset.is_some() {
@@ -2521,6 +2522,116 @@ mod runtime_config_reconciliation_tests {
                 settled(&handler).await;
                 assert_eq!(power_cap().await, Some(230.0));
                 assert_eq!(*applied.borrow(), [Some(230.0), Some(220.0), Some(230.0)]);
+            })
+            .await;
+    }
+
+    /// Applies like an NVIDIA controller whose runtime helper cannot run.
+    #[cfg(feature = "nvidia")]
+    struct OutageController(crate::server::gpu_controller::HelperOutage);
+
+    #[cfg(feature = "nvidia")]
+    impl GpuController for OutageController {
+        fn controller_type(&self) -> &'static str {
+            "test"
+        }
+        fn controller_info(&self) -> &CommonControllerInfo {
+            unreachable!()
+        }
+        fn device_type(&self) -> DeviceType {
+            unreachable!()
+        }
+        fn get_info(&self, _: bool, _: bool) -> LocalBoxFuture<'_, DeviceInfo> {
+            unreachable!()
+        }
+        fn friendly_name(&self) -> Option<String> {
+            None
+        }
+        fn note_previous_config(&self, previous: &GpuConfig) {
+            self.0.note_previous_config(previous);
+        }
+        fn apply_config<'a>(
+            &'a self,
+            config: &'a GpuConfig,
+        ) -> LocalBoxFuture<'a, anyhow::Result<()>> {
+            let error = self.0.apply_config(config);
+            async { Err(error) }.boxed_local()
+        }
+        fn get_stats(&self, _: Option<&GpuConfig>) -> DeviceStats {
+            unreachable!()
+        }
+        fn get_clocks_info(&self, _: Option<&GpuConfig>) -> anyhow::Result<ClocksInfo> {
+            unreachable!()
+        }
+        fn get_power_states(&self, _: Option<&GpuConfig>) -> PowerStates {
+            unreachable!()
+        }
+        fn reset_clocks(&self) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        fn get_power_profile_modes(&self) -> anyhow::Result<PowerProfileModesTable> {
+            unreachable!()
+        }
+        fn vbios_dump(&self) -> anyhow::Result<Vec<u8>> {
+            unreachable!()
+        }
+        fn process_list(&self) -> anyhow::Result<ProcessList> {
+            unreachable!()
+        }
+    }
+
+    /// New rail or clock settings in the first edit of a GPU without saved
+    /// settings cannot take effect during an outage, so they are rejected
+    /// instead of becoming the reference for later edits.
+    #[cfg(feature = "nvidia")]
+    #[tokio::test]
+    async fn first_edit_of_an_unconfigured_gpu_rejects_new_voltage_settings_during_an_outage() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let mut config = Config::default();
+                config.apply_settings_timer = 120;
+                let controller =
+                    OutageController(crate::server::gpu_controller::HelperOutage::default());
+                let handler = handler_with(
+                    config,
+                    BTreeMap::from([("gpu".into(), Box::new(controller) as DynGpuController)]),
+                );
+                for clocks in [false, true] {
+                    let mut rejected = gpu_config(230.0);
+                    if clocks {
+                        rejected
+                            .clocks_configuration
+                            .mem_clock_offsets
+                            .insert(0, 100);
+                    } else {
+                        rejected.nvidia_rail_controls = Some(lact_schema::NvidiaRailControls {
+                            nvvdd: lact_schema::NvidiaRailSettings {
+                                max_voltage_uv: Some(1_125_000),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        });
+                    }
+                    assert!(handler.set_gpu_config("gpu", rejected).await.is_err());
+                    assert!(handler.get_gpu_config("gpu").await.unwrap().is_none());
+                }
+                // The defaults are still the reference, so a power edit is kept.
+                assert_eq!(
+                    handler
+                        .set_gpu_config("gpu", gpu_config(230.0))
+                        .await
+                        .unwrap(),
+                    120
+                );
+                assert_eq!(
+                    handler
+                        .get_gpu_config("gpu")
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .power_cap,
+                    Some(230.0)
+                );
             })
             .await;
     }

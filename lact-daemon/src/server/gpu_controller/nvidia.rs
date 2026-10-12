@@ -1506,16 +1506,7 @@ impl NvidiaGpuController {
         self.apply_independent_groups(config, degraded.groups, &mut deferred)
             .await
             .with_context(|| format!("{unavailable:#}"))?;
-        let error = unavailable.context(
-            "Applied power, fan and thermal settings; voltage boost, rail and clock settings stay pending",
-        );
-        // New voltage or clock requests cannot take effect, so the change as a
-        // whole failed; otherwise only earlier pending settings are still waiting.
-        if degraded.new_voltage_request {
-            Err(error)
-        } else {
-            Err(super::partially_applied(error))
-        }
+        Err(degraded_outcome(degraded.new_voltage_request, unavailable))
     }
 
     /// Writes every independent group even when an earlier one fails, so a
@@ -1572,6 +1563,41 @@ impl NvidiaGpuController {
             }
         }
         Ok(())
+    }
+}
+
+/// The result of an Apply without a usable helper once its independent groups
+/// are written. New voltage or clock requests cannot take effect, so the change
+/// as a whole failed; otherwise only earlier pending settings are still waiting.
+fn degraded_outcome(new_voltage_request: bool, unavailable: anyhow::Error) -> anyhow::Error {
+    let error = unavailable.context(
+        "Applied power, fan and thermal settings; voltage boost, rail and clock settings stay pending",
+    );
+    if new_voltage_request {
+        error
+    } else {
+        super::partially_applied(error)
+    }
+}
+
+/// The Apply results of an NVIDIA controller whose runtime helper cannot run,
+/// for testing callers without NVML. Its independent groups always succeed.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct HelperOutage(RefCell<apply_plan::AppliedState>);
+
+#[cfg(test)]
+impl HelperOutage {
+    pub(crate) fn note_previous_config(&self, previous: &GpuConfig) {
+        self.0.borrow_mut().note_previous(previous);
+    }
+
+    pub(crate) fn apply_config(&self, config: &GpuConfig) -> anyhow::Error {
+        let degraded = self.0.borrow_mut().begin_without_helper(config);
+        degraded_outcome(
+            degraded.new_voltage_request,
+            runtime_controls::unavailable(anyhow!("synthetic helper outage")),
+        )
     }
 }
 
@@ -2144,6 +2170,10 @@ impl GpuController for NvidiaGpuController {
             }
             Ok(())
         })
+    }
+
+    fn note_previous_config(&self, previous: &GpuConfig) {
+        self.applied_state.borrow_mut().note_previous(previous);
     }
 
     fn restore_runtime_controls(&self) -> LocalBoxFuture<'_, anyhow::Result<()>> {
