@@ -348,7 +348,9 @@ not establish a fixed physical voltage. OCP readback is a configured threshold,
 not measured current. These runtime controls do not edit VBIOS images or VFE
 equations. `Maximum (REL)` adjusts the reliability policy only; an operating
 limit or OV can still constrain the separately displayed effective maximum.
-The reported rail voltage is a driver reading, not a verified physical ADC
+The rail reference is a driver-reported value: older providers send it as
+`reported_voltage_uv`, newer ones as `telemetry.default_uv`, and both read the
+same field. It is not a measured rail voltage or a verified physical ADC
 measurement. `Refresh readings` updates these readings without changing pending
 entries or reloading the GPU configuration.
 
@@ -371,6 +373,16 @@ are omitted, and reported unavailability reasons are shown in the telemetry
 details. These readings describe the last successful query, not continuous
 sampling or independently verified physical measurements.
 
+A provider can also report each rail's alternate reliability limit (ALT/VOP) as
+a read-only reading. Firmware evaluates it separately from `Maximum (REL)` and
+from OV; how it combines with them is not documented, and its value is neither a
+fixed voltage nor evidence that the limit is being applied. LACT shows its
+runtime selector and fresh evaluation, the selector alone when no evaluation is
+available, or that the rail has no runtime selector. ALT/VOP has no requested
+value, LACT cannot change it, and its runtime selector does not identify a VBIOS
+policy row. No ALT/VOP line means the provider could not establish the rail's
+identity or predates this reading.
+
 Leave an entry blank to release only that field and restore its value from before
 LACT took ownership. `Restore all rail controls` (or removing
 `nvidia_rail_controls`) releases all fields owned by the provider through the
@@ -381,13 +393,38 @@ or factory values; preexisting rail settings from outside LACT are preserved.
 
 NVIDIA Apply is incremental by settings group. A power-cap-only change does
 not reset or reapply clocks, VRAM settings, curves, propagation ratios or fans;
-a rail-only change likewise preserves those groups. Clock changes still perform
-the necessary clock reset, then prepare voltage boost and rail policies before
-applying the new clock settings. Startup, controller reload and explicit resets
-invalidate the relevant cached state. Only a fully successful Apply becomes the
-new baseline, so a partial failure cannot turn restoration of the previous
-configuration into a skipped operation. Releasing rail controls still checks the
-provider's durable ownership even when the local configuration is unchanged.
+a rail-only change likewise preserves those groups. Power cap, PowerMizer, fan
+and target-temperature settings are applied first: they do not depend on rail
+policies, so a later rail or clock failure cannot leave them unapplied. Clock
+changes still perform the necessary clock reset, then prepare voltage boost and
+rail policies before applying the new clock settings. Startup, controller reload
+and explicit resets invalidate the relevant cached state. Only a fully
+successful Apply becomes the new baseline, so a partial failure cannot turn
+restoration of the previous configuration into a skipped operation. Releasing
+rail controls still checks the provider's durable ownership even when the local
+configuration is unchanged. Voltage boost and target-temperature failures are
+logged as warnings instead of failing the Apply, and the next Apply retries them.
+
+If the provider cannot run, Apply still sets the power cap, PowerMizer mode,
+fans and target temperature, and keeps voltage boost, rail and clock settings
+pending. This covers a missing or unusable executable or Python environment, a
+failed start, invalid output, and a timeout after which the provider process was
+confirmed to have exited. Startup, configuration reloads and profile switches
+report an error but keep those independent settings applied. An Apply from the
+GUI that changes only independent settings keeps them under the normal
+confirmation and revert while earlier voltage settings keep waiting; one that
+changes voltage boost, rails or clocks is rejected, and the previous settings
+are applied the same way. Once the provider works again, Apply again or restart
+the daemon to apply the pending settings. A provider response that reports
+pending recovery, an unfinished change of this daemon, or a provider process
+that did not exit after being killed still blocks every setting until recovery
+completes. A new power limit can change policy state that an unfinished native
+provider transaction verifies, which may then require manual recovery.
+
+If a GPU reload or profile switch cannot recover the provider or reset clocks
+first, LACT skips the full cleanup, which would release rail policies, but still
+stops its fan control loop and returns the fans to automatic control. The next
+Apply writes the fan settings again.
 
 Providers advertising `capabilities.profile_transactions: 1` support a durable
 profile transaction. LACT stages rail policies with a checkpoint before applying
