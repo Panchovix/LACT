@@ -126,6 +126,12 @@ pub trait GpuController {
         async { Ok(()) }.boxed_local()
     }
 
+    /// Stop background fan control and return fans to automatic control when a
+    /// failed reset rules out `cleanup`, leaving clocks and voltages untouched.
+    fn release_fan_control(&self) -> LocalBoxFuture<'_, anyhow::Result<()>> {
+        async { Ok(()) }.boxed_local()
+    }
+
     fn reset_clocks(&self) -> anyhow::Result<()>;
 
     fn get_power_profile_modes(&self) -> anyhow::Result<PowerProfileModesTable>;
