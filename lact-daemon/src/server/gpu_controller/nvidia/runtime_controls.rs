@@ -91,11 +91,13 @@ pub(super) struct RuntimeControls {
 #[derive(Default)]
 struct DeviceGuard {
     lock: Arc<Mutex<()>>,
-    /// Set by a valid reply that reports recovery and by any failed call that
-    /// could have written; cleared only by a valid reply without recovery.
+    /// Set from the start of a call that could write and by a valid reply that
+    /// reports recovery; cleared only by a valid reply without recovery. Only
+    /// the call holding `lock` updates it, so a reply cannot clear a later
+    /// call's mark.
     recovery_outstanding: AtomicBool,
     /// A killed helper may still be inside a native call.
-    unreaped: Arc<AtomicBool>,
+    unreaped: AtomicBool,
 }
 
 /// Keyed by GPU UUID and BDF.
@@ -651,7 +653,7 @@ impl RuntimeControls {
             !self.guard.unreaped.load(Ordering::SeqCst),
             "A killed NVIDIA runtime helper has not exited yet"
         );
-        let unreaped = self.guard.unreaped.clone();
+        let guard = self.guard.clone();
         let config = self.config.clone();
         let device = self.device.clone();
         let settings = settings.cloned();
@@ -659,9 +661,15 @@ impl RuntimeControls {
         let request_id = request_id.map(str::to_owned);
         let reap_timeout = self.reap_timeout;
         let (tx, rx) = oneshot::channel();
-        // Cancellation must not unlock the GPU while its child is still running.
+        // A cancelled caller can neither unlock the GPU while its child is still
+        // running nor lose what the outcome means for recovery: the task records
+        // it under the lock before handing the result over.
         tokio::spawn(async move {
             let _lock = lock;
+            if action.may_write() {
+                // Native state stays unknown until a valid reply says otherwise.
+                guard.recovery_outstanding.store(true, Ordering::SeqCst);
+            }
             let request = HelperRequest {
                 action,
                 settings,
@@ -670,30 +678,23 @@ impl RuntimeControls {
             };
             let (result, running) = invoke_process(config, device, request, reap_timeout).await;
             if let Some(mut child) = running {
-                unreaped.store(true, Ordering::SeqCst);
+                guard.unreaped.store(true, Ordering::SeqCst);
+                let guard = guard.clone();
                 tokio::spawn(async move {
                     let _ = child.wait().await;
-                    unreaped.store(false, Ordering::SeqCst);
+                    guard.unreaped.store(false, Ordering::SeqCst);
                 });
+            }
+            if let Ok(info) = &result {
+                guard
+                    .recovery_outstanding
+                    .store(reports_recovery(info), Ordering::SeqCst);
             }
             let _ = tx.send(result);
         });
-        let result = rx
-            .await
+        rx.await
             .context("NVIDIA runtime helper task was interrupted")
-            .and_then(|result| result);
-        match &result {
-            Ok(info) => self
-                .guard
-                .recovery_outstanding
-                .store(reports_recovery(info), Ordering::SeqCst),
-            Err(_) if action.may_write() => self
-                .guard
-                .recovery_outstanding
-                .store(true, Ordering::SeqCst),
-            Err(_) => (),
-        }
-        result
+            .and_then(|result| result)
     }
 }
 
@@ -1350,6 +1351,64 @@ mod tests {
         mode("fail");
         let error = runtime.prepare_apply(None, |_| Ok(())).await.unwrap_err();
         assert!(is_unavailable(&error), "{error:#}");
+    }
+
+    /// Holds the helper until the test answers on the `gate` socket.
+    const GATE: &str = "import socket\ns=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)\ns.connect(os.path.join(state_dir,'gate'))\ns.sendall(b'x')\nassert s.recv(1)==b'x'\ns.close()";
+
+    /// A cancelled caller cannot drop what its helper's outcome means for a
+    /// later outage. Without degrading, an Apply returns before writing any
+    /// independent group.
+    #[tokio::test]
+    async fn cancelled_write_still_decides_whether_a_later_outage_may_degrade() {
+        let recovery = RESPONSE.replace("\"rails\"", "\"recovery_required\":true,\"rails\"");
+        for (outcome, degrades) in [
+            ("sys.exit(1)".to_owned(), false),
+            (format!("print({recovery:?})"), false),
+            (format!("print({RESPONSE:?})"), true),
+        ] {
+            let (dir, runtime) = fake(&format!("{GATE}\n{outcome}"), 5000);
+            let listener = tokio::net::UnixListener::bind(dir.path().join("gate")).unwrap();
+            let runtime = Arc::new(runtime);
+            let caller = runtime.clone();
+            let call = tokio::spawn(async move { caller.apply(None).await });
+            let (mut gate, _) = listener.accept().await.unwrap();
+            gate.read_u8().await.unwrap();
+            call.abort();
+            assert!(call.await.unwrap_err().is_cancelled());
+            gate.write_all(b"x").await.unwrap();
+            // The helper's task holds the GPU lock until it has finished.
+            drop(runtime.guard.lock.lock().await);
+            let mut reloaded = runtime.reloaded();
+            reloaded.config.executable = reloaded.config.state_dir.join("missing-helper");
+            let error = reloaded.prepare_apply(None, |_| Ok(())).await.unwrap_err();
+            assert_eq!(is_unavailable(&error), degrades, "{outcome}: {error:#}");
+        }
+    }
+
+    /// Outcomes are recorded in the order the helpers ran, not in the order
+    /// their callers resume.
+    #[tokio::test]
+    async fn an_earlier_clean_reply_cannot_clear_a_later_failed_write() {
+        let (dir, runtime) = fake(
+            &format!(
+                "if open(os.path.join(state_dir,'mode')).read()=='fail': sys.exit(1)\nprint({RESPONSE:?})"
+            ),
+            2000,
+        );
+        let mode = |value: &str| fs::write(dir.path().join("mode"), value).unwrap();
+        mode("");
+        let mut earlier = Box::pin(runtime.status());
+        assert!(futures::poll!(earlier.as_mut()).is_pending());
+        // Its helper finishes, but its caller does not resume yet.
+        drop(runtime.guard.lock.lock().await);
+        mode("fail");
+        assert!(runtime.apply(None).await.is_err());
+        assert!(earlier.await.available);
+        let mut reloaded = runtime.reloaded();
+        reloaded.config.executable = reloaded.config.state_dir.join("missing-helper");
+        let error = reloaded.prepare_apply(None, |_| Ok(())).await.unwrap_err();
+        assert!(!is_unavailable(&error), "{error:#}");
     }
 }
 
