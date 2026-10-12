@@ -10,6 +10,8 @@ use intel::IntelGpuController;
 use lact_schema::DeviceApiInfo;
 use lact_schema::DeviceType;
 use lact_schema::ProcessList;
+#[cfg(all(test, feature = "nvidia"))]
+pub(crate) use nvidia::HelperOutage;
 #[cfg(feature = "nvidia")]
 use nvidia::NvidiaGpuController;
 use tokio::join;
@@ -115,6 +117,12 @@ pub trait GpuController {
     fn cleanup(&self) -> LocalBoxFuture<'_, ()> {
         async {}.boxed_local()
     }
+
+    /// Called before applying an edit with the configuration it replaces: the
+    /// saved one, or the defaults when there is none. A controller that has
+    /// applied nothing yet then compares the edit with it, while startup and
+    /// profile switches apply an existing configuration without a note.
+    fn note_previous_config(&self, _previous: &GpuConfig) {}
 
     /// Release persistent ownership even when this GPU has no saved configuration.
     fn restore_runtime_controls(&self) -> LocalBoxFuture<'_, anyhow::Result<()>> {
