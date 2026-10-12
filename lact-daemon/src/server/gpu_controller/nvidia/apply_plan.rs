@@ -86,6 +86,13 @@ impl Group {
         Self::Thermal,
     ];
 
+    /// Applied first: their writes do not depend on rail policies, so a later
+    /// rail or clock failure cannot leave them unapplied.
+    const INDEPENDENT: [Self; 4] = [Self::PowerCap, Self::PowerMizer, Self::Fans, Self::Thermal];
+
+    /// Rail policies settle before new boost and clock settings, in this order.
+    pub(super) const VOLTAGE_COUPLED: [Self; 3] = [Self::Boost, Self::Rails, Self::Clocks];
+
     fn bit(self) -> u8 {
         1 << self as u8
     }
@@ -107,23 +114,24 @@ impl ApplyPlan {
         self.groups & group.bit() != 0
     }
 
+    /// The groups that remain applicable without a usable runtime helper.
+    pub(super) fn independent_groups(self) -> Vec<Group> {
+        Group::INDEPENDENT
+            .into_iter()
+            .filter(|group| self.includes(*group))
+            .collect()
+    }
+
     pub(super) fn steps(self) -> Vec<Step> {
-        let mut steps = Vec::new();
-        for group in [Group::PowerCap, Group::PowerMizer] {
-            if self.includes(group) {
-                steps.push(Step::Apply(group));
-            }
-        }
+        let mut steps: Vec<_> = self
+            .independent_groups()
+            .into_iter()
+            .map(Step::Apply)
+            .collect();
         if self.includes(Group::Clocks) {
             steps.push(Step::ResetClocks);
         }
-        for group in [
-            Group::Boost,
-            Group::Rails,
-            Group::Clocks,
-            Group::Fans,
-            Group::Thermal,
-        ] {
+        for group in Group::VOLTAGE_COUPLED {
             if self.includes(group) {
                 steps.push(Step::Apply(group));
             }
@@ -135,6 +143,8 @@ impl ApplyPlan {
 #[derive(Default)]
 pub(super) struct AppliedState {
     last_successful: Option<GpuConfig>,
+    /// The latest configuration whose voltage-coupled groups wait for the helper.
+    pending_voltage: Option<GpuConfig>,
     uncertain: u8,
 }
 
@@ -171,6 +181,7 @@ impl AppliedState {
 
     pub(super) fn complete(&mut self, config: &GpuConfig) {
         self.last_successful = Some(config.clone());
+        self.pending_voltage = None;
         self.uncertain = 0;
     }
 
@@ -180,7 +191,28 @@ impl AppliedState {
 
     pub(super) fn invalidate_all(&mut self) {
         self.last_successful = None;
+        self.pending_voltage = None;
         self.uncertain = 0;
+    }
+
+    /// Leaves `desired`'s boost, rail and clock settings waiting for the helper.
+    /// Returns whether they differ from the settings already applied or waiting,
+    /// meaning that this change itself cannot take effect yet.
+    pub(super) fn defer_voltage_groups(&mut self, desired: &GpuConfig) -> bool {
+        let baseline = self
+            .pending_voltage
+            .as_ref()
+            .or(self.last_successful.as_ref());
+        let changed = baseline.is_none_or(|baseline| {
+            Group::VOLTAGE_COUPLED
+                .into_iter()
+                .any(|group| !equal(group, baseline, desired))
+        });
+        for group in Group::VOLTAGE_COUPLED {
+            self.uncertain |= group.bit();
+        }
+        self.pending_voltage = Some(desired.clone());
+        changed
     }
 }
 
@@ -388,20 +420,102 @@ mod tests {
                 }
             }
             let recovery = state.plan(&original);
-            for group in attempted {
-                assert!(
+            for group in Group::ALL {
+                // A clock reset also brings back the voltage groups it precedes.
+                let forced = attempted.contains(&Group::Clocks)
+                    && matches!(group, Group::Boost | Group::Rails);
+                assert_eq!(
                     recovery.includes(group),
-                    "{failed:?} failure omitted {group:?} recovery"
+                    attempted.contains(&group) || forced,
+                    "{failed:?} failure: wrong {group:?} recovery"
                 );
-            }
-            if !matches!(failed, Group::Fans | Group::Thermal) {
-                assert!(!recovery.includes(Group::Fans));
-                assert!(!recovery.includes(Group::Thermal));
             }
             // The earlier success snapshot survives the failed execution.
             assert_eq!(state.last_successful.as_ref(), Some(&original));
             state.complete(&original);
             assert!(groups(state.plan(&original)).is_empty());
+        }
+    }
+
+    #[test]
+    fn independent_groups_are_applied_before_the_voltage_coupled_ones() {
+        let state = AppliedState::default();
+        assert_eq!(
+            state.plan(&configured()).steps(),
+            [
+                Step::Apply(Group::PowerCap),
+                Step::Apply(Group::PowerMizer),
+                Step::Apply(Group::Fans),
+                Step::Apply(Group::Thermal),
+                Step::ResetClocks,
+                Step::Apply(Group::Boost),
+                Step::Apply(Group::Rails),
+                Step::Apply(Group::Clocks),
+            ]
+        );
+    }
+
+    #[test]
+    fn unusable_helper_applies_independent_groups_and_keeps_voltage_groups_pending() {
+        let original = configured();
+        let mut state = AppliedState::default();
+        state.complete(&original);
+        let mut desired = original.clone();
+        desired.power_cap = Some(230.0);
+        // The daemon applies only these while the helper cannot run.
+        let plan = state.plan(&desired);
+        assert_eq!(plan.independent_groups(), [Group::PowerCap]);
+        assert!(!state.defer_voltage_groups(&desired));
+        for group in plan.independent_groups() {
+            state.attempted(group);
+        }
+        // Unchanged voltage settings are still applied once the helper works.
+        assert_eq!(
+            state.plan(&desired).steps(),
+            [
+                Step::Apply(Group::PowerCap),
+                Step::ResetClocks,
+                Step::Apply(Group::Boost),
+                Step::Apply(Group::Rails),
+                Step::Apply(Group::Clocks),
+            ]
+        );
+        state.complete(&desired);
+        assert!(groups(state.plan(&desired)).is_empty());
+    }
+
+    #[test]
+    fn deferred_voltage_settings_tell_new_requests_from_ones_already_waiting() {
+        let original = configured();
+        let mut state = AppliedState::default();
+        // Nothing applied yet, e.g. a helper that already failed at startup.
+        assert!(state.defer_voltage_groups(&original));
+        let mut power = original.clone();
+        power.power_cap = Some(230.0);
+        assert!(!state.defer_voltage_groups(&power));
+        let mut clocks = power.clone();
+        clocks.clocks_configuration.mem_clock_offsets.insert(0, 100);
+        assert!(state.defer_voltage_groups(&clocks));
+        // Reverting the rejected change compares against it, so it is new again.
+        assert!(state.defer_voltage_groups(&power));
+        let mut rails = power.clone();
+        rails.nvidia_rail_controls = None;
+        assert!(state.defer_voltage_groups(&rails));
+        // A complete Apply makes the applied settings the only baseline.
+        state.complete(&original);
+        assert!(!state.defer_voltage_groups(&power));
+        state.invalidate_all();
+        assert!(state.defer_voltage_groups(&power));
+    }
+
+    #[test]
+    fn warned_or_released_groups_are_retried_alone_with_unchanged_settings() {
+        let original = configured();
+        let mut state = AppliedState::default();
+        for retried in [Group::Boost, Group::Thermal, Group::Fans] {
+            state.complete(&original);
+            state.invalidate(retried);
+            assert_eq!(state.plan(&original).steps(), [Step::Apply(retried)]);
         }
     }
 

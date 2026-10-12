@@ -453,7 +453,7 @@ impl<'a> Handler {
             controller.apply_config(&new_config).await
         }
         .await;
-        match result {
+        match result.or_else(accept_partial_apply) {
             Ok(()) => {
                 self.config
                     .write()
@@ -469,6 +469,7 @@ impl<'a> Handler {
                 match controller
                     .apply_config(&previous_config.unwrap_or_default())
                     .await
+                    .or_else(accept_partial_apply)
                 {
                     Ok(()) => Err(apply_err.context("Could not apply settings")),
                     Err(err) => Err(apply_err.context(err.context(
@@ -534,6 +535,7 @@ impl<'a> Handler {
                         if let Err(err) = controller
                             .apply_config(&previous_config.unwrap_or_default())
                             .await
+                            .or_else(accept_partial_apply)
                         {
                             error!("could not revert settings: {err:#}");
                         }
@@ -1509,6 +1511,17 @@ pub(crate) struct SnapshotDeviceInfo {
     pub power_states: PowerStates,
 }
 
+/// A partial Apply keeps the applied part under the normal confirmation; only
+/// settings that were already pending still wait, so it is not rolled back.
+fn accept_partial_apply(error: anyhow::Error) -> anyhow::Result<()> {
+    if super::gpu_controller::is_partially_applied(&error) {
+        warn!("settings were partially applied: {error:#}");
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
 async fn apply_config_to_controllers(
     controllers: &BTreeMap<String, Box<dyn GpuController>>,
     config: &Config,
@@ -2343,6 +2356,120 @@ mod runtime_config_reconciliation_tests {
                         .power_cap,
                     Some(100.0)
                 );
+            })
+            .await;
+    }
+
+    /// Writes power settings, then reports that earlier pending settings still
+    /// wait, as an NVIDIA controller does while its runtime helper is down.
+    struct PartialController {
+        applied: Rc<RefCell<Vec<Option<f64>>>>,
+    }
+
+    impl GpuController for PartialController {
+        fn controller_type(&self) -> &'static str {
+            "test"
+        }
+        fn controller_info(&self) -> &CommonControllerInfo {
+            unreachable!()
+        }
+        fn device_type(&self) -> DeviceType {
+            unreachable!()
+        }
+        fn get_info(&self, _: bool, _: bool) -> LocalBoxFuture<'_, DeviceInfo> {
+            unreachable!()
+        }
+        fn friendly_name(&self) -> Option<String> {
+            None
+        }
+        fn apply_config<'a>(
+            &'a self,
+            config: &'a GpuConfig,
+        ) -> LocalBoxFuture<'a, anyhow::Result<()>> {
+            self.applied.borrow_mut().push(config.power_cap);
+            async {
+                Err(crate::server::gpu_controller::partially_applied(anyhow!(
+                    "synthetic helper outage"
+                )))
+            }
+            .boxed_local()
+        }
+        fn get_stats(&self, _: Option<&GpuConfig>) -> DeviceStats {
+            unreachable!()
+        }
+        fn get_clocks_info(&self, _: Option<&GpuConfig>) -> anyhow::Result<ClocksInfo> {
+            unreachable!()
+        }
+        fn get_power_states(&self, _: Option<&GpuConfig>) -> PowerStates {
+            unreachable!()
+        }
+        fn reset_clocks(&self) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        fn get_power_profile_modes(&self) -> anyhow::Result<PowerProfileModesTable> {
+            unreachable!()
+        }
+        fn vbios_dump(&self) -> anyhow::Result<Vec<u8>> {
+            unreachable!()
+        }
+        fn process_list(&self) -> anyhow::Result<ProcessList> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_apply_keeps_new_settings_under_the_normal_confirmation() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let applied = Rc::default();
+                let mut config = Config::default();
+                config.apply_settings_timer = 120;
+                config
+                    .gpus_mut()
+                    .unwrap()
+                    .insert("gpu".into(), gpu_config(250.0));
+                let controller = PartialController {
+                    applied: Rc::clone(&applied),
+                };
+                let handler = handler_with(
+                    config,
+                    BTreeMap::from([("gpu".into(), Box::new(controller) as DynGpuController)]),
+                );
+                let power_cap = async || {
+                    handler
+                        .get_gpu_config("gpu")
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .power_cap
+                };
+                // No rollback: the new power cap stays while confirmation is pending.
+                assert_eq!(
+                    handler
+                        .set_gpu_config("gpu", gpu_config(230.0))
+                        .await
+                        .unwrap(),
+                    120
+                );
+                assert_eq!(power_cap().await, Some(230.0));
+                let saved = handler.config_last_saved.get();
+                handler
+                    .confirm_pending_config(ConfirmCommand::Confirm)
+                    .unwrap();
+                settled(&handler).await;
+                assert!(handler.config_last_saved.get() > saved);
+                assert_eq!(*applied.borrow(), [Some(230.0)]);
+                // Reverting re-applies the previous settings the same way.
+                handler
+                    .set_gpu_config("gpu", gpu_config(220.0))
+                    .await
+                    .unwrap();
+                handler
+                    .confirm_pending_config(ConfirmCommand::Revert)
+                    .unwrap();
+                settled(&handler).await;
+                assert_eq!(power_cap().await, Some(230.0));
+                assert_eq!(*applied.borrow(), [Some(230.0), Some(220.0), Some(230.0)]);
             })
             .await;
     }
