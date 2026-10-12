@@ -152,7 +152,8 @@ impl ApplyPlan {
 #[derive(Default)]
 pub(super) struct AppliedState {
     last_successful: Option<GpuConfig>,
-    /// The latest configuration whose voltage-coupled groups wait for the helper.
+    /// The latest configuration whose voltage-coupled groups wait for the
+    /// helper, or the one an edit replaces when nothing was applied yet.
     pending_voltage: Option<GpuConfig>,
     uncertain: u8,
 }
@@ -204,6 +205,15 @@ impl AppliedState {
         self.uncertain = 0;
     }
 
+    /// With nothing applied or waiting yet, an edit is compared with the
+    /// configuration it replaces, so new boost, rail or clock settings in it
+    /// count as a change instead of becoming the reference.
+    pub(super) fn note_previous(&mut self, previous: &GpuConfig) {
+        if self.last_successful.is_none() && self.pending_voltage.is_none() {
+            self.pending_voltage = Some(previous.clone());
+        }
+    }
+
     /// Starts an Apply without a usable helper: the independent groups to write
     /// now are marked attempted, and boost, rails and clocks are left pending.
     pub(super) fn begin_without_helper(&mut self, desired: &GpuConfig) -> DegradedApply {
@@ -235,8 +245,9 @@ impl AppliedState {
         for group in Group::VOLTAGE_COUPLED {
             self.uncertain |= group.bit();
         }
-        // With nothing known, e.g. at startup or after a profile switch, the
-        // configuration being applied is the best reference for later changes.
+        // With nothing known, as when startup or a profile switch applies an
+        // existing configuration, that configuration is the best reference for
+        // later changes. Edits note the configuration they replace first.
         if !changed {
             self.pending_voltage = Some(desired.clone());
         }
@@ -546,6 +557,27 @@ mod tests {
         assert!(new_request(&clocks));
         state.invalidate_all();
         assert!(!state.begin_without_helper(&clocks).new_voltage_request);
+    }
+
+    #[test]
+    fn an_edit_is_compared_with_the_configuration_it_replaces() {
+        let mut state = AppliedState::default();
+        // The first edit of a GPU without saved settings, during an outage.
+        state.note_previous(&GpuConfig::default());
+        let power = GpuConfig {
+            power_cap: Some(230.0),
+            ..Default::default()
+        };
+        let mut rails = power.clone();
+        rails.nvidia_rail_controls = configured().nvidia_rail_controls;
+        let mut clocks = power.clone();
+        clocks.clocks_configuration.mem_clock_offsets.insert(0, 100);
+        assert!(state.begin_without_helper(&rails).new_voltage_request);
+        assert!(state.begin_without_helper(&clocks).new_voltage_request);
+        assert!(!state.begin_without_helper(&power).new_voltage_request);
+        // A note never replaces a reference that is already known.
+        state.note_previous(&configured());
+        assert!(state.begin_without_helper(&rails).new_voltage_request);
     }
 
     #[test]
