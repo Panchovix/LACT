@@ -303,26 +303,31 @@ impl<'a> Handler {
     }
 
     async fn reload_gpus_inner(&self) {
+        self.reload_gpus_from(&drm_base_path()).await;
+    }
+
+    async fn reload_gpus_from(&self, base_path: &Path) {
         let mut controllers_guard = self.gpu_controllers.write().await;
         let config = self.config.read().await;
         let detached_ids = self.ignored_gpu_ids.read().await;
 
-        let base_path = drm_base_path();
         let pci_db = read_pci_db();
-        match load_controllers(&base_path, &pci_db, &detached_ids, &config) {
+        match load_controllers(base_path, &pci_db, &detached_ids, &config) {
             Ok(new_controllers) => {
                 info!(
                     "GPU list reloaded with {} devices, reapplying configuration",
                     new_controllers.len()
                 );
 
-                for old_controller in controllers_guard.values() {
+                for (id, old_controller) in controllers_guard.iter() {
                     if let Err(err) = old_controller.prepare_reset().await {
                         error!("could not recover controller before reload: {err:#}");
+                        release_fan_control(id, old_controller.as_ref()).await;
                         continue;
                     }
                     if let Err(err) = old_controller.reset_clocks() {
                         error!("could not reset clocks before controller cleanup: {err:#}");
+                        release_fan_control(id, old_controller.as_ref()).await;
                         continue;
                     }
                     old_controller.cleanup().await;
@@ -1437,12 +1442,14 @@ impl<'a> Handler {
         for (id, controller) in controllers.iter() {
             if let Err(err) = controller.prepare_reset().await {
                 error!("could not recover controller {id} before cleanup: {err:#}");
+                release_fan_control(id, controller.as_ref()).await;
                 continue;
             }
             if !disable_clocks_cleanup {
                 debug!("resetting clocks table");
                 if let Err(err) = controller.reset_clocks() {
                     error!("could not reset the clocks table: {err}");
+                    release_fan_control(id, controller.as_ref()).await;
                     continue;
                 }
             }
@@ -1774,6 +1781,14 @@ fn drm_base_path() -> PathBuf {
     match env::var("_LACT_DRM_SYSFS_PATH") {
         Ok(custom_path) => PathBuf::from(custom_path),
         Err(_) => PathBuf::from("/sys/class/drm"),
+    }
+}
+
+/// A failed reset leaves clocks and voltages alone, but background fan
+/// control must not outlive the cleanup that was skipped.
+async fn release_fan_control(id: &str, controller: &dyn GpuController) {
+    if let Err(err) = controller.release_fan_control().await {
+        error!("could not release fan control of {id}: {err:#}");
     }
 }
 
@@ -2580,5 +2595,166 @@ mod runtime_config_reconciliation_tests {
         let previous_saved = handler.config_last_saved.get();
         handler.reload_config(Config::default()).await.unwrap();
         assert_eq!(handler.config_last_saved.get(), previous_saved);
+    }
+
+    /// Owns a background fan loop that only `cleanup` or `release_fan_control` stops.
+    struct FanLoopController {
+        log: Rc<RefCell<Vec<&'static str>>>,
+        fail_prepare: bool,
+        fail_reset: bool,
+        ticks: Rc<Cell<u32>>,
+        task: RefCell<Option<(Rc<tokio::sync::Notify>, JoinHandle<()>)>>,
+    }
+
+    impl FanLoopController {
+        fn started(
+            log: &Rc<RefCell<Vec<&'static str>>>,
+            fail_prepare: bool,
+            fail_reset: bool,
+        ) -> Self {
+            let notify = Rc::new(tokio::sync::Notify::new());
+            let ticks = Rc::new(Cell::new(0));
+            let (task_notify, task_ticks) = (notify.clone(), ticks.clone());
+            let handle = tokio::task::spawn_local(async move {
+                loop {
+                    select! {
+                        () = sleep(Duration::from_millis(2)) => task_ticks.set(task_ticks.get() + 1),
+                        () = task_notify.notified() => break,
+                    }
+                }
+            });
+            Self {
+                log: log.clone(),
+                fail_prepare,
+                fail_reset,
+                ticks,
+                task: RefCell::new(Some((notify, handle))),
+            }
+        }
+
+        async fn stop(&self, event: &'static str) {
+            self.log.borrow_mut().push(event);
+            let task = self.task.take();
+            if let Some((notify, handle)) = task {
+                notify.notify_one();
+                handle.await.unwrap();
+            }
+        }
+    }
+
+    impl GpuController for FanLoopController {
+        fn controller_type(&self) -> &'static str {
+            "test"
+        }
+        fn controller_info(&self) -> &CommonControllerInfo {
+            unreachable!()
+        }
+        fn device_type(&self) -> DeviceType {
+            unreachable!()
+        }
+        fn get_info(&self, _: bool, _: bool) -> LocalBoxFuture<'_, DeviceInfo> {
+            unreachable!()
+        }
+        fn friendly_name(&self) -> Option<String> {
+            None
+        }
+        fn apply_config<'a>(&'a self, _: &'a GpuConfig) -> LocalBoxFuture<'a, anyhow::Result<()>> {
+            self.log.borrow_mut().push("apply");
+            async { Ok(()) }.boxed_local()
+        }
+        fn prepare_reset(&self) -> LocalBoxFuture<'_, anyhow::Result<()>> {
+            let fail = self.fail_prepare;
+            async move {
+                anyhow::ensure!(!fail, "synthetic recovery failure");
+                Ok(())
+            }
+            .boxed_local()
+        }
+        fn reset_clocks(&self) -> anyhow::Result<()> {
+            anyhow::ensure!(!self.fail_reset, "synthetic reset failure");
+            Ok(())
+        }
+        fn release_fan_control(&self) -> LocalBoxFuture<'_, anyhow::Result<()>> {
+            async {
+                self.stop("release").await;
+                Ok(())
+            }
+            .boxed_local()
+        }
+        fn cleanup(&self) -> LocalBoxFuture<'_, ()> {
+            self.stop("cleanup").boxed_local()
+        }
+        fn get_stats(&self, _: Option<&GpuConfig>) -> DeviceStats {
+            unreachable!()
+        }
+        fn get_clocks_info(&self, _: Option<&GpuConfig>) -> anyhow::Result<ClocksInfo> {
+            unreachable!()
+        }
+        fn get_power_states(&self, _: Option<&GpuConfig>) -> PowerStates {
+            unreachable!()
+        }
+        fn get_power_profile_modes(&self) -> anyhow::Result<PowerProfileModesTable> {
+            unreachable!()
+        }
+        fn vbios_dump(&self) -> anyhow::Result<Vec<u8>> {
+            unreachable!()
+        }
+        fn process_list(&self) -> anyhow::Result<ProcessList> {
+            unreachable!()
+        }
+    }
+
+    async fn assert_loop_stopped(ticks: &Cell<u32>) {
+        let stopped = ticks.get();
+        sleep(Duration::from_millis(30)).await;
+        assert_eq!(ticks.get(), stopped, "the old fan loop is still running");
+    }
+
+    #[tokio::test]
+    async fn failed_reset_during_reload_releases_fans_instead_of_leaking_the_loop() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let no_gpus = tempfile::tempdir().unwrap();
+                for (fail_prepare, fail_reset) in [(true, false), (false, true)] {
+                    let log = Rc::default();
+                    let controller = FanLoopController::started(&log, fail_prepare, fail_reset);
+                    let ticks = controller.ticks.clone();
+                    let handler = handler_with(
+                        Config::default(),
+                        BTreeMap::from([("gpu".into(), Box::new(controller) as DynGpuController)]),
+                    );
+                    handler.reload_gpus_from(no_gpus.path()).await;
+                    assert!(handler.gpu_controllers.read().await.is_empty());
+                    assert_eq!(*log.borrow(), ["release"]);
+                    assert_loop_stopped(&ticks).await;
+                }
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn failed_reset_during_profile_switch_releases_fans_without_cleanup() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let log = Rc::default();
+                let controller = FanLoopController::started(&log, false, true);
+                let ticks = controller.ticks.clone();
+                let mut config = Config::default();
+                config
+                    .profiles
+                    .insert(Rc::from("other"), Profile::default());
+                let handler = handler_with(
+                    config,
+                    BTreeMap::from([("gpu".into(), Box::new(controller) as DynGpuController)]),
+                );
+                handler
+                    .set_profile(Some(Rc::from("other")), false)
+                    .await
+                    .unwrap();
+                // Neither the default settings nor the rail-releasing cleanup ran.
+                assert_eq!(*log.borrow(), ["release"]);
+                assert_loop_stopped(&ticks).await;
+            })
+            .await;
     }
 }
