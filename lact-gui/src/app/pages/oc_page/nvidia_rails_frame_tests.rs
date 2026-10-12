@@ -109,6 +109,51 @@ fn blank_voltage_releases_last_owned_field_and_noop_empty_config_is_preserved() 
     assert!(config.is_none());
 }
 
+fn synthetic_alt_vop() -> NvidiaAltVopPolicy {
+    NvidiaAltVopPolicy {
+        selector_present: true,
+        selector: Some(264),
+        evaluated_uv: Some(1135000),
+        writable: false,
+        identity: lact_schema::NvidiaAltVopIdentity {
+            source: "runtime_rail_info".to_owned(),
+            policy: "ALT_VOP".to_owned(),
+            rail_index: 0,
+            rail_enum: 1,
+            object_type: 3,
+        },
+    }
+}
+
+#[test]
+fn alt_vop_reads_as_text_only_and_legacy_voltage_as_the_rail_reference() {
+    let mut alt_vop = synthetic_alt_vop();
+    assert_eq!(
+        alt_vop_reading(&alt_vop),
+        fl!(
+            I18N,
+            "nvidia-rails-alt-vop",
+            value = "1135",
+            selector = "264"
+        )
+    );
+    alt_vop.evaluated_uv = None;
+    assert_eq!(
+        alt_vop_reading(&alt_vop),
+        fl!(I18N, "nvidia-rails-alt-vop-unknown", selector = "264")
+    );
+    alt_vop.selector_present = false;
+    alt_vop.selector = None;
+    assert_eq!(
+        alt_vop_reading(&alt_vop),
+        fl!(I18N, "nvidia-rails-alt-vop-absent")
+    );
+    assert_eq!(
+        telemetry_reading("default", 900125),
+        fl!(I18N, "nvidia-rails-reference", value = "900.125")
+    );
+}
+
 #[cfg(feature = "gtk-tests")]
 #[test]
 #[ignore = "requires a GTK display; run this exact test explicitly"]
@@ -196,6 +241,7 @@ fn rail_panel_load_is_not_an_edit_and_unsupported_fields_are_preserved() {
                     arbitrated_ocp_ma: Some(180000),
                     ..Default::default()
                 }),
+                alt_vop: Some(synthetic_alt_vop()),
             }],
         }),
     });
@@ -209,6 +255,12 @@ fn rail_panel_load_is_not_an_edit_and_unsupported_fields_are_preserved() {
             .contains("123.456")
     );
     assert!(frame.model().voltage_readbacks[0].text().contains("180"));
+    // ALT/VOP is a separate read-only line; the REL entry stays its own control.
+    assert!(
+        frame.model().voltage_readbacks[0]
+            .text()
+            .contains(&alt_vop_reading(&synthetic_alt_vop()))
+    );
     assert!(frame.widgets().telemetry_details.text().contains("875.125"));
     assert!(!frame.widgets().telemetry_details.text().contains("NVVDD"));
     frame.model().rows[0].entry.set_text("925.1250");
