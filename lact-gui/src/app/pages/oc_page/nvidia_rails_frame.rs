@@ -5,7 +5,8 @@ use crate::{
 use adw::prelude::*;
 use i18n_embed_fl::fl;
 use lact_schema::{
-    NvidiaRail, NvidiaRailControls, NvidiaRailSettings, NvidiaRuntimeInfo, NvidiaRuntimeRail,
+    NvidiaAltVopPolicy, NvidiaRail, NvidiaRailControls, NvidiaRailSettings, NvidiaRuntimeInfo,
+    NvidiaRuntimeRail,
 };
 use relm4::{ComponentParts, ComponentSender};
 use std::{cell::Cell, rc::Rc};
@@ -321,6 +322,7 @@ impl relm4::Component for NvidiaRailsFrame {
             let readback = rail
                 .map(|rail| {
                     let mut readings = Vec::new();
+                    // Older providers send the rail reference only under this name.
                     if let Some(value) = rail.reported_voltage_uv
                         && rail
                             .telemetry
@@ -328,11 +330,7 @@ impl relm4::Component for NvidiaRailsFrame {
                             .and_then(|telemetry| telemetry.default_uv)
                             .is_none()
                     {
-                        readings.push(fl!(
-                            I18N,
-                            "nvidia-rails-reported",
-                            value = format_units(value)
-                        ));
+                        readings.push(telemetry_reading("default", value));
                     }
                     if let Some(value) = rail.effective_max_uv {
                         readings.push(fl!(
@@ -340,6 +338,9 @@ impl relm4::Component for NvidiaRailsFrame {
                             "nvidia-rails-effective",
                             value = format_units(value)
                         ));
+                    }
+                    if let Some(alt_vop) = &rail.alt_vop {
+                        readings.push(alt_vop_reading(alt_vop));
                     }
                     if let Some(telemetry) = &rail.telemetry {
                         for (name, value) in [
@@ -573,6 +574,25 @@ fn telemetry_reading(name: &str, value: u32) -> String {
         "adc" => fl!(I18N, "nvidia-rails-adc", value = value),
         "current" => fl!(I18N, "nvidia-rails-current", value = value),
         _ => fl!(I18N, "nvidia-rails-arbitrated-ocp", value = value),
+    }
+}
+
+/// A runtime reading only: ALT/VOP is neither REL nor an editable request.
+fn alt_vop_reading(alt_vop: &NvidiaAltVopPolicy) -> String {
+    if !alt_vop.selector_present {
+        return fl!(I18N, "nvidia-rails-alt-vop-absent");
+    }
+    let selector = alt_vop
+        .selector
+        .map_or_else(|| "?".to_owned(), |selector| selector.to_string());
+    match alt_vop.evaluated_uv {
+        Some(value) => fl!(
+            I18N,
+            "nvidia-rails-alt-vop",
+            value = format_units(value),
+            selector = selector
+        ),
+        None => fl!(I18N, "nvidia-rails-alt-vop-unknown", selector = selector),
     }
 }
 

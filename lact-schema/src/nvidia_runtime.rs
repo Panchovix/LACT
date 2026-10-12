@@ -55,6 +55,31 @@ pub struct NvidiaRuntimeRail {
     pub effective_max_uv: Option<u32>,
     pub reported_voltage_uv: Option<u32>,
     pub telemetry: Option<NvidiaRailTelemetry>,
+    /// Omitted when the provider has not verified this rail's identity.
+    pub alt_vop: Option<NvidiaAltVopPolicy>,
+}
+
+/// Read-only alternate operating-voltage policy; it is never a requested setting.
+#[skip_serializing_none]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NvidiaAltVopPolicy {
+    /// False when the runtime rail reports no selector for this policy.
+    pub selector_present: bool,
+    pub selector: Option<u16>,
+    /// Missing when no positive fresh evaluation is available.
+    pub evaluated_uv: Option<u32>,
+    pub writable: bool,
+    pub identity: NvidiaAltVopIdentity,
+}
+
+/// Runtime identity only; it does not name a VBIOS policy row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NvidiaAltVopIdentity {
+    pub source: String,
+    pub policy: String,
+    pub rail_index: u32,
+    pub rail_enum: u32,
+    pub object_type: u32,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -195,5 +220,39 @@ mod tests {
         );
         assert!(!info.recovery_required);
         assert!(info.transaction_id.is_none());
+    }
+
+    #[test]
+    fn alt_vop_is_an_optional_read_only_reading_with_runtime_identity() {
+        let identity = |rail_index, rail_enum| {
+            serde_json::json!({"source":"runtime_rail_info","policy":"ALT_VOP",
+                "rail_index":rail_index,"rail_enum":rail_enum,"object_type":3})
+        };
+        let raw = serde_json::json!({"protocol_version":1,"available":true,
+            "device":{"uuid":"GPU-test","bdf":"0000:06:00.0"},"managed":false,
+            "rails":[
+                {"rail":"NVVDD","alt_vop":{"selector_present":true,"selector":264,
+                    "evaluated_uv":1135000,"writable":false,"identity":identity(0, 1)}},
+                {"rail":"MSVDD","alt_vop":{"selector_present":false,"writable":false,
+                    "identity":identity(1, 3)}}]});
+        let info: NvidiaRuntimeInfo = serde_json::from_value(raw.clone()).unwrap();
+        let present = info.rails[0].alt_vop.as_ref().unwrap();
+        assert_eq!(
+            (present.selector, present.evaluated_uv),
+            (Some(264), Some(1135000))
+        );
+        assert_eq!(present.identity.rail_enum, 1);
+        let absent = info.rails[1].alt_vop.as_ref().unwrap();
+        assert!(!absent.selector_present && absent.selector.is_none());
+        assert!(absent.evaluated_uv.is_none());
+        assert_eq!(serde_json::to_value(info).unwrap(), raw);
+
+        // Providers before the reading omit it, which stays distinct from absent.
+        let old: NvidiaRuntimeRail = serde_json::from_str(r#"{"rail":"NVVDD"}"#).unwrap();
+        assert!(old.alt_vop.is_none());
+        // Runtime selectors are u16 values.
+        let invalid = serde_json::json!({"rail":"NVVDD","alt_vop":{"selector_present":true,
+            "selector":65536,"writable":false,"identity":identity(0, 1)}});
+        assert!(serde_json::from_value::<NvidiaRuntimeRail>(invalid).is_err());
     }
 }
