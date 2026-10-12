@@ -72,6 +72,46 @@ pub struct Daemon {
     pub disable_nvapi: Option<bool>,
     pub tcp_listen_address: Option<String>,
     pub metrics: Option<Metrics>,
+    #[serde(default)]
+    pub nvidia_runtime: Option<NvidiaRuntimeHelperConfig>,
+}
+
+/// Administrator-provided external runtime controls. Never configured by GPU RPCs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NvidiaRuntimeHelperConfig {
+    pub executable: PathBuf,
+    pub state_dir: PathBuf,
+    #[serde(default = "default_nvidia_runtime_timeout")]
+    pub timeout_ms: u64,
+}
+
+fn default_nvidia_runtime_timeout() -> u64 {
+    10_000
+}
+
+#[cfg(feature = "nvidia")]
+impl NvidiaRuntimeHelperConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.executable.is_absolute(),
+            "NVIDIA runtime executable must be absolute"
+        );
+        anyhow::ensure!(
+            self.state_dir.is_absolute(),
+            "NVIDIA runtime state directory must be absolute"
+        );
+        anyhow::ensure!(
+            self.timeout_ms > 0,
+            "NVIDIA runtime timeout must be positive"
+        );
+        anyhow::ensure!(
+            Instant::now()
+                .checked_add(Duration::from_millis(self.timeout_ms))
+                .is_some(),
+            "NVIDIA runtime timeout is too large"
+        );
+        Ok(())
+    }
 }
 
 impl Default for Daemon {
@@ -93,6 +133,7 @@ impl Default for Daemon {
             tcp_listen_address: None,
             disable_nvapi: None,
             metrics: None,
+            nvidia_runtime: None,
         }
     }
 }

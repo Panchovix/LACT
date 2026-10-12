@@ -290,3 +290,6 @@ pub enum ConnectionStatusMsg {
     Disconnected,
     Reconnected,
 }
+
+#[cfg(test)]
+mod tests;

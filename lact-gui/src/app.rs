@@ -124,7 +124,7 @@ pub struct AppModel {
 
     gpu_selector: relm4::Controller<GpuSelector>,
     profile_selector: relm4::Controller<ProfileSelector>,
-    stats_task_handle: Option<glib::JoinHandle<()>>,
+    stats_task_stop: Option<tokio::sync::oneshot::Sender<()>>,
 
     settings_changed: BoolBinding,
 
@@ -516,7 +516,7 @@ impl AsyncComponent for AppModel {
             service_setup_dialog: None,
             ui_sensitive,
             is_reconnecting: BoolBinding::new(false),
-            stats_task_handle: None,
+            stats_task_stop: None,
             settings_changed,
             system_info,
             device_flags: vec![],
@@ -654,6 +654,19 @@ impl AppModel {
                 } else {
                     self.update_gpu_data(gpu_id, sender).await?;
                 }
+            }
+            AppMsg::RefreshNvidiaRuntime => {
+                let gpu_id = Self::get_selected_gpu_id()?;
+                let info = self
+                    .daemon_client
+                    .get_device_info(&gpu_id, Some(false))
+                    .await
+                    .context("Could not refresh NVIDIA voltage readings")?;
+                // Refresh readings only; retain pending edits and the selected profile.
+                self.oc_page.emit(OcPageMsg::NvidiaRuntimeInfo {
+                    is_nvidia: info.driver.split_ascii_whitespace().next() == Some("nvidia"),
+                    info: info.nvidia_runtime,
+                });
             }
             AppMsg::ReloadApiInfo => {
                 let gpu_id = Self::get_selected_gpu_id()?;
@@ -800,6 +813,8 @@ impl AppModel {
                 });
             }
             AppMsg::ApplyChanges => {
+                // Local input errors must preserve every pending edit.
+                self.oc_page.model().validate_nvidia_rail_config()?;
                 self.apply_settings(Self::get_selected_gpu_id()?, root, &sender)
                     .await
                     .inspect_err(|_| {
@@ -949,8 +964,8 @@ impl AppModel {
                     .set_visible_child_name(PageId::Crash.as_str());
                 self.crash_page.emit(message);
 
-                if let Some(handle) = self.stats_task_handle.take() {
-                    handle.abort();
+                if let Some(stop) = self.stats_task_stop.take() {
+                    let _ = stop.send(());
                 }
             }
             AppMsg::Quit => {
@@ -1130,8 +1145,8 @@ impl AppModel {
         gpu_id: String,
         sender: AsyncComponentSender<AppModel>,
     ) -> anyhow::Result<Arc<DeviceStats>> {
-        if let Some(stats_task) = self.stats_task_handle.take() {
-            stats_task.abort();
+        if let Some(stop) = self.stats_task_stop.take() {
+            let _ = stop.send(());
         }
 
         debug!("updating info for gpu {gpu_id}");
@@ -1140,8 +1155,7 @@ impl AppModel {
             .daemon_client
             .get_gpu_config(&gpu_id)
             .await
-            .ok()
-            .flatten();
+            .context("Could not fetch GPU configuration; existing controls were preserved")?;
 
         let info = self
             .daemon_client
@@ -1160,6 +1174,12 @@ impl AppModel {
                 .as_ref()
                 .map(|config| config.nvidia_power_cap_mode)
                 .unwrap_or_default(),
+        ));
+
+        self.oc_page.emit(OcPageMsg::NvidiaRailControls(
+            gpu_config
+                .as_ref()
+                .and_then(|config| config.nvidia_rail_controls.clone()),
         ));
 
         let stats = self
@@ -1219,7 +1239,7 @@ impl AppModel {
             Err(err) => warn!("could not get power states: {err:?}"),
         }
 
-        self.stats_task_handle = Some(start_stats_update_loop(
+        self.stats_task_stop = Some(start_stats_update_loop(
             gpu_id.to_owned(),
             self.daemon_client.clone(),
             sender,
@@ -1244,7 +1264,11 @@ impl AppModel {
             .unwrap_or_else(GpuConfig::default);
         let oc = self.oc_page.model().serialize(&stored_config);
         let mut gpu_config = GpuConfig {
-            power_cap: oc.power.power_cap,
+            power_cap: if oc.power.power_cap_changed {
+                oc.power.power_cap
+            } else {
+                stored_config.power_cap
+            },
             nvidia_power_cap_mode: oc
                 .power
                 .nvidia_power_cap_mode
@@ -1258,6 +1282,10 @@ impl AppModel {
             uma_carveout: oc.uma_carveout,
             ..stored_config
         };
+
+        self.oc_page
+            .model()
+            .apply_nvidia_rail_config(&mut gpu_config)?;
 
         // fixme: switch to serialize()
         self.thermals_page.model().apply_config(&mut gpu_config);
@@ -1444,14 +1472,29 @@ fn start_stats_update_loop(
     gpu_id: String,
     daemon_client: DaemonClient,
     sender: AsyncComponentSender<AppModel>,
-) -> glib::JoinHandle<()> {
+) -> tokio::sync::oneshot::Sender<()> {
+    use futures::future::{Either, select};
+    use tokio::sync::oneshot::{self, error::TryRecvError};
+
     debug!("spawning new stats update task");
+    let (stop, mut stopped) = oneshot::channel();
     relm4::spawn_local(async move {
         loop {
             let duration = Duration::from_millis(CONFIG.read().stats_poll_interval_ms as u64);
-            tokio::time::sleep(duration).await;
+            if matches!(
+                select(Box::pin(tokio::time::sleep(duration)), &mut stopped).await,
+                Either::Right(_)
+            ) {
+                return;
+            }
 
-            match daemon_client.get_device_stats(&gpu_id).await {
+            // Finish an in-flight exchange before stopping; aborting it could
+            // leave its response for the next configuration request to consume.
+            let stats = daemon_client.get_device_stats(&gpu_id).await;
+            if !matches!(stopped.try_recv(), Err(TryRecvError::Empty)) {
+                return;
+            }
+            match stats {
                 Ok(stats) => {
                     sender.input(AppMsg::Stats(Arc::new(stats)));
                 }
@@ -1460,7 +1503,11 @@ fn start_stats_update_loop(
                 }
             }
 
-            match daemon_client.list_profiles(false).await {
+            let profiles = daemon_client.list_profiles(false).await;
+            if !matches!(stopped.try_recv(), Err(TryRecvError::Empty)) {
+                return;
+            }
+            match profiles {
                 Ok(profiles) => {
                     sender.input(AppMsg::ProfilesPolled(Arc::new(profiles)));
                 }
@@ -1469,7 +1516,8 @@ fn start_stats_update_loop(
                 }
             }
         }
-    })
+    });
+    stop
 }
 
 async fn create_connection(

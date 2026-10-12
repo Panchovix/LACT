@@ -27,6 +27,13 @@ daemon:
   # Disables fetching of additional information through NvAPI on Nvidia GPUs.
   # Not set by default.
   disable_nvapi: false
+  # Optional external NVIDIA rail-control provider. Disabled unless configured.
+  # Install the provider separately in an administrator-owned prefix.
+  # Changing these daemon options requires a service restart.
+  # nvidia_runtime:
+  #   executable: /opt/nvidia-runtime-tools/bin/nvidia-runtime
+  #   state_dir: /var/lib/lact/nvidia-runtime
+  #   timeout_ms: 10000
   # Daemon's TCP listening address. Not specified by default.
   # By default TCP access is disabled, and only a unix socket is present.
   # Specifying this option enables the TCP listener.
@@ -265,3 +272,158 @@ current_profile: vkcube
 # If profiles should be switched between automatically based on their configured rules.
 auto_switch_profiles: true
 ```
+
+
+## Optional NVIDIA rail controls
+
+The optional external `nvidia-runtime` provider adds separate NVVDD and MSVDD
+controls to the overclocking page. `Voltages` shows driver-reported voltage,
+evaluated limits and directly editable VMIN/REL requests for each supported rail.
+The separate `NVIDIA protections` section holds OV and OCP controls. LACT uses
+a typed JSON interface; native implementation and verification data are maintained outside the LACT source tree.
+Without provider configuration, LACT does not launch the provider. Unsupported
+GPUs or driver versions remain unavailable rather than inheriting another GPU's
+capabilities.
+
+Install a provider release that supports protocol 1 and its `lact-bridge` command
+in an administrator-owned prefix. The executable and its ancestors must not be
+writable by other users. A root daemon will therefore reject an executable in a
+user-owned checkout. For example, a separately installed Python environment may
+provide `/opt/nvidia-runtime-tools/bin/nvidia-runtime`. Install the provider code
+and dependencies under the same administrative ownership; do not point its
+launcher at user-writable source files.
+
+Create a private state directory and configure the daemon:
+
+```yaml
+daemon:
+  nvidia_runtime:
+    executable: /opt/nvidia-runtime-tools/bin/nvidia-runtime
+    state_dir: /var/lib/lact/nvidia-runtime
+    timeout_ms: 10000
+```
+
+The state directory's parent must already exist. The provider creates the final
+directory with mode 0700, or requires an existing directory owned by the daemon
+user with that mode. Keep this directory: deleting it does not restore GPU
+settings. Changes to the helper path, directory or timeout require a daemon
+restart, like other daemon options.
+
+Voltage requests can be edited directly when the provider reports support.
+OV and OCP editing has its own enable checkbox; turning it off releases only
+those protection requests, preserving VMIN and REL. Edits take effect through
+Apply and confirmation. Settings remain separate from clock offsets and V/F curves:
+
+```yaml
+# Inside the selected GPU's configuration; values here only illustrate units.
+nvidia_rail_controls:
+  nvvdd:
+    min_voltage_uv: 800000
+    max_voltage_uv: 850000
+    overvoltage_uv: 1100000
+    ocp_limit_ma: 88000
+  msvdd: {}
+```
+
+The GUI displays millivolts and amperes, accepting up to three fractional digits;
+the configuration and protocol preserve integer microvolts and milliamperes.
+For example, `850.125 mV` is `850125 uV`, and `88.2 A` is `88200 mA`. Voltage
+controls do not invent slider endpoints when the provider has no verified range.
+OCP uses its reported configuration bounds, which are not an electrical safety
+recommendation.
+
+| Setting | Meaning |
+| --- | --- |
+| Minimum (VMIN) | Requested minimum-voltage policy |
+| Maximum reliability (REL) | Requested reliability-voltage ceiling |
+| Overvoltage (OV) | Separate overvoltage-policy ceiling, in advanced controls |
+| OCP | Configured output-current protection threshold, in advanced controls |
+
+Absolute voltage entries are estimates at application time. The provider converts
+them to policy offsets and retains those concrete offsets when the same request
+is reapplied, avoiding cumulative drift from rounding or temperature. Requested
+values and fresh evaluated readings are shown separately. Other active limits
+and firmware voltage steps still apply: equal minimum and maximum requests do
+not establish a fixed physical voltage. OCP readback is a configured threshold,
+not measured current. These runtime controls do not edit VBIOS images or VFE
+equations. `Maximum (REL)` adjusts the reliability policy only; an operating
+limit or OV can still constrain the separately displayed effective maximum.
+The reported rail voltage is a driver reading, not a verified physical ADC
+measurement. `Refresh readings` updates these readings without changing pending
+entries or reloading the GPU configuration.
+
+Optional telemetry is read-only and is not saved as a requested setting. The
+provider can report the following values independently of whether a policy is
+writable:
+
+| Reading | Meaning |
+| --- | --- |
+| Target voltage | Driver-reported voltage target |
+| Reference/default voltage | Driver-reported reference; not the provider's ownership restoration baseline |
+| Sensed voltage | Driver-reported sensed voltage, separate from requested or evaluated policies |
+| Current | Reported rail output current, separate from the configured OCP threshold |
+| Arbitrated OCP | Reported threshold after policy arbitration, separate from the configured OCP request |
+| ADC voltage | A sample from an identified ADC sensor; rail association is shown only when the provider has established it |
+
+Unmapped ADC sensors retain their sensor identities and an unknown rail mapping;
+LACT does not infer NVVDD or MSVDD from a similar voltage. Missing measurements
+are omitted, and reported unavailability reasons are shown in the telemetry
+details. These readings describe the last successful query, not continuous
+sampling or independently verified physical measurements.
+
+Leave an entry blank to release only that field and restore its value from before
+LACT took ownership. `Restore all rail controls` (or removing
+`nvidia_rail_controls`) releases all fields owned by the provider through the
+normal Apply flow, including when managed recovery is reported unavailable.
+An empty object requests no new values; releasing previously owned fields can
+still require restoration writes. Restoring ownership differs from forcing zeros
+or factory values; preexisting rail settings from outside LACT are preserved.
+
+NVIDIA Apply is incremental by settings group. A power-cap-only change does
+not reset or reapply clocks, VRAM settings, curves, propagation ratios or fans;
+a rail-only change likewise preserves those groups. Clock changes still perform
+the necessary clock reset, then prepare voltage boost and rail policies before
+applying the new clock settings. Startup, controller reload and explicit resets
+invalidate the relevant cached state. Only a fully successful Apply becomes the
+new baseline, so a partial failure cannot turn restoration of the previous
+configuration into a skipped operation. Releasing rail controls still checks the
+provider's durable ownership even when the local configuration is unchanged.
+
+Providers advertising `capabilities.profile_transactions: 1` support a durable
+profile transaction. LACT stages rail policies with a checkpoint before applying
+the subsequent clock, fan and thermal changes, and commits after all groups
+succeed. On failure, it compensates any newly attempted frequency settings while
+preserving voltage boost and domain voltage demands, then rolls back the exact
+rail values and ownership checkpoint. An unconfirmed compensation or rollback
+retains recovery state and blocks further changes. Returning frequency settings
+to their software baseline does not guarantee lower physical frequency or
+stability, especially when previous offsets were negative.
+
+Older protocol-1 providers remain compatible through an apply-last fallback:
+LACT defers their rail Apply until the other groups succeed. This fallback does
+not provide a checkpoint spanning the whole profile change or guarantee that
+rail policies take effect before new clock settings. Updating the provider is
+required for those transaction guarantees.
+
+Apply uses LACT's normal confirmation and revert flow. Configuration mutations
+are serialized through application and confirmation/reversion. Competing edits
+and profile changes are rejected while a confirmation is pending. Reset,
+shutdown and configuration reload wait for the active operation. An
+administrator's file edit deferred by confirmation is saved again when resumed,
+so the older confirmation cannot leave the file and active configuration at
+different revisions.
+
+The provider saves recovery information before native writes, validates identity
+and readback, and restores pre-transaction values on a failed change. Unconfirmed
+recovery remains explicit and blocks new settings. The GUI keeps the recovery
+reason visible and offers `Restore all rail controls` even when new writes are
+unavailable or no requested fields remain in the local configuration. A known
+interrupted transaction is recovered before new settings or resets; an unknown
+checkpoint requires an explicit release request. Recovery can still fail, in
+which case its record is retained. Unexpected changes outside owned controls
+require manual inspection rather than silently discarding the recovery record.
+A new boot starts from new readings; it does not replay old opaque buffers or old
+ownership baselines.
+
+The GUI and protocol do not extend XBAR/SYS/Video V/F-curve editing. Their existing
+clock/domain settings retain their own controls and configuration.
