@@ -122,12 +122,9 @@ impl ApplyPlan {
             .collect()
     }
 
-    pub(super) fn steps(self) -> Vec<Step> {
-        let mut steps: Vec<_> = self
-            .independent_groups()
-            .into_iter()
-            .map(Step::Apply)
-            .collect();
+    /// The clock reset and voltage-coupled groups, in the order they are written.
+    pub(super) fn voltage_steps(self) -> Vec<Step> {
+        let mut steps = Vec::new();
         if self.includes(Group::Clocks) {
             steps.push(Step::ResetClocks);
         }
@@ -136,6 +133,18 @@ impl ApplyPlan {
                 steps.push(Step::Apply(group));
             }
         }
+        steps
+    }
+
+    /// Every step in Apply order: the independent groups, then `voltage_steps`.
+    #[cfg(test)]
+    fn steps(self) -> Vec<Step> {
+        let mut steps: Vec<_> = self
+            .independent_groups()
+            .into_iter()
+            .map(Step::Apply)
+            .collect();
+        steps.extend(self.voltage_steps());
         steps
     }
 }
@@ -195,15 +204,30 @@ impl AppliedState {
         self.uncertain = 0;
     }
 
-    /// Leaves `desired`'s boost, rail and clock settings waiting for the helper.
-    /// Returns whether they differ from the settings already applied or waiting,
-    /// meaning that this change itself cannot take effect yet.
-    pub(super) fn defer_voltage_groups(&mut self, desired: &GpuConfig) -> bool {
+    /// Starts an Apply without a usable helper: the independent groups to write
+    /// now are marked attempted, and boost, rails and clocks are left pending.
+    pub(super) fn begin_without_helper(&mut self, desired: &GpuConfig) -> DegradedApply {
+        let groups = self.plan(desired).independent_groups();
+        let new_voltage_request = self.defer_voltage_groups(desired);
+        for group in &groups {
+            self.attempted(*group);
+        }
+        DegradedApply {
+            groups,
+            new_voltage_request,
+        }
+    }
+
+    /// Returns whether `desired` asks for boost, rail or clock settings other
+    /// than the ones applied or already waiting, which cannot take effect yet.
+    /// Only settings that may take effect later replace the waiting ones, so
+    /// reverting a rejected request compares against what was there before it.
+    fn defer_voltage_groups(&mut self, desired: &GpuConfig) -> bool {
         let baseline = self
             .pending_voltage
             .as_ref()
             .or(self.last_successful.as_ref());
-        let changed = baseline.is_none_or(|baseline| {
+        let changed = baseline.is_some_and(|baseline| {
             Group::VOLTAGE_COUPLED
                 .into_iter()
                 .any(|group| !equal(group, baseline, desired))
@@ -211,9 +235,18 @@ impl AppliedState {
         for group in Group::VOLTAGE_COUPLED {
             self.uncertain |= group.bit();
         }
-        self.pending_voltage = Some(desired.clone());
+        // With nothing known, e.g. at startup or after a profile switch, the
+        // configuration being applied is the best reference for later changes.
+        if !changed {
+            self.pending_voltage = Some(desired.clone());
+        }
         changed
     }
+}
+
+pub(super) struct DegradedApply {
+    pub(super) groups: Vec<Group>,
+    pub(super) new_voltage_request: bool,
 }
 
 fn equal(group: Group, previous: &GpuConfig, desired: &GpuConfig) -> bool {
@@ -463,12 +496,9 @@ mod tests {
         let mut desired = original.clone();
         desired.power_cap = Some(230.0);
         // The daemon applies only these while the helper cannot run.
-        let plan = state.plan(&desired);
-        assert_eq!(plan.independent_groups(), [Group::PowerCap]);
-        assert!(!state.defer_voltage_groups(&desired));
-        for group in plan.independent_groups() {
-            state.attempted(group);
-        }
+        let degraded = state.begin_without_helper(&desired);
+        assert_eq!(degraded.groups, [Group::PowerCap]);
+        assert!(!degraded.new_voltage_request);
         // Unchanged voltage settings are still applied once the helper works.
         assert_eq!(
             state.plan(&desired).steps(),
@@ -485,27 +515,37 @@ mod tests {
     }
 
     #[test]
-    fn deferred_voltage_settings_tell_new_requests_from_ones_already_waiting() {
+    fn degraded_applies_tell_new_voltage_requests_from_ones_already_waiting() {
         let original = configured();
         let mut state = AppliedState::default();
-        // Nothing applied yet, e.g. a helper that already failed at startup.
-        assert!(state.defer_voltage_groups(&original));
+        let mut new_request = |config: &GpuConfig| {
+            let degraded = state.begin_without_helper(config);
+            degraded.new_voltage_request
+        };
+        // Startup with a broken helper: the configuration becomes the reference.
+        assert!(!new_request(&original));
         let mut power = original.clone();
         power.power_cap = Some(230.0);
-        assert!(!state.defer_voltage_groups(&power));
+        assert!(!new_request(&power));
         let mut clocks = power.clone();
         clocks.clocks_configuration.mem_clock_offsets.insert(0, 100);
-        assert!(state.defer_voltage_groups(&clocks));
-        // Reverting the rejected change compares against it, so it is new again.
-        assert!(state.defer_voltage_groups(&power));
+        assert!(new_request(&clocks));
+        // Reverting the rejected change finds the earlier reference intact.
+        assert!(!new_request(&power));
         let mut rails = power.clone();
         rails.nvidia_rail_controls = None;
-        assert!(state.defer_voltage_groups(&rails));
-        // A complete Apply makes the applied settings the only baseline.
+        assert!(new_request(&rails));
+        assert!(!new_request(&power));
+        // A complete Apply makes the applied settings the reference.
         state.complete(&original);
-        assert!(!state.defer_voltage_groups(&power));
+        let mut new_request = |config: &GpuConfig| {
+            let degraded = state.begin_without_helper(config);
+            degraded.new_voltage_request
+        };
+        assert!(!new_request(&power));
+        assert!(new_request(&clocks));
         state.invalidate_all();
-        assert!(state.defer_voltage_groups(&power));
+        assert!(!state.begin_without_helper(&clocks).new_voltage_request);
     }
 
     #[test]

@@ -90,7 +90,7 @@ async fn rollback_failure_blocks_next_apply_until_recovery_succeeds() {
 async fn unknown_profile_requires_explicit_release_and_frequency_discovery() {
     let (dir, runtime) = profile_fake();
     let _transaction = runtime.stage(Some(&requested())).await.unwrap();
-    let restarted = RuntimeControls::new(runtime.config.clone(), runtime.device.clone());
+    let restarted = runtime.restarted();
     assert!(restarted.has_unknown_profile_transaction().await.unwrap());
     assert!(restarted.recover_pending(false).await.is_err());
     assert!(!actions(&dir).iter().any(|action| action == "rollback"));
@@ -156,8 +156,12 @@ async fn own_unfinished_change_keeps_every_apply_precondition_fail_closed() {
     assert!(!is_unavailable(
         &runtime.recover(true, |_| Ok(())).await.unwrap_err()
     ));
-    // A controller without an unfinished change of its own may degrade instead.
-    let restarted = RuntimeControls::new(runtime.config.clone(), runtime.device.clone());
+    // A GPU reload replaces the controller but keeps what it knew.
+    let reloaded = runtime.reloaded();
+    let error = reloaded.prepare_apply(None, |_| Ok(())).await.unwrap_err();
+    assert!(!is_unavailable(&error), "{error:#}");
+    // A new daemon knows nothing, so the same outage degrades there.
+    let restarted = runtime.restarted();
     let error = restarted.prepare_apply(None, |_| Ok(())).await.unwrap_err();
     assert!(is_unavailable(&error), "{error:#}");
 }
@@ -166,7 +170,7 @@ async fn own_unfinished_change_keeps_every_apply_precondition_fail_closed() {
 async fn recovery_reported_by_a_valid_reply_survives_later_helper_failures() {
     let (dir, runtime) = profile_fake();
     let _staged = runtime.stage(Some(&requested())).await.unwrap();
-    let mut restarted = RuntimeControls::new(runtime.config.clone(), runtime.device.clone());
+    let mut restarted = runtime.restarted();
     // The first status reports another instance's checkpoint; the next one fails.
     fs::write(dir.path().join("mode"), "status_once").unwrap();
     let error = restarted
@@ -192,7 +196,7 @@ async fn recovery_reported_by_a_valid_reply_survives_later_helper_failures() {
 async fn unknown_checkpoint_recovers_frequencies_before_any_rail_rollback() {
     let (dir, runtime) = profile_fake();
     let _staged = runtime.stage(Some(&requested())).await.unwrap();
-    let restarted = RuntimeControls::new(runtime.config.clone(), runtime.device.clone());
+    let restarted = runtime.restarted();
     let mut discovered = Vec::new();
     restarted
         .prepare_apply(None, |unknown| {
@@ -220,13 +224,13 @@ async fn unknown_checkpoint_recovers_frequencies_before_any_rail_rollback() {
 async fn reported_or_own_unfinished_recovery_is_never_unavailability() {
     let (dir, runtime) = profile_fake();
     let staged = runtime.stage(Some(&requested())).await.unwrap();
-    let restarted = RuntimeControls::new(runtime.config.clone(), runtime.device.clone());
+    let restarted = runtime.restarted();
     let reported = restarted.recover_pending(false).await.unwrap_err();
     assert!(!is_unavailable(&reported), "{reported:#}");
     fs::write(dir.path().join("mode"), "rollback_failure").unwrap();
     let ours = runtime.recover_pending(false).await.unwrap_err();
     assert!(!is_unavailable(&ours), "{ours:#}");
-    let mut stopped = RuntimeControls::new(runtime.config.clone(), runtime.device.clone());
+    let mut stopped = runtime.restarted();
     *stopped.pending.lock().await = Some(staged);
     stopped.config.executable = stopped.config.state_dir.join("missing-helper");
     let unanswered = stopped.recover_pending(false).await.unwrap_err();
