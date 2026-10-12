@@ -1500,26 +1500,41 @@ impl NvidiaGpuController {
         unavailable: anyhow::Error,
     ) -> anyhow::Result<()> {
         self.complete_frequency_recovery()?;
-        let plan = self.applied_state.borrow().plan(config);
-        let new_voltage_request = self.applied_state.borrow_mut().defer_voltage_groups(config);
+        let degraded = self.applied_state.borrow_mut().begin_without_helper(config);
         // Without complete(), every attempted group also stays pending.
         let mut deferred = Vec::new();
-        for group in plan.independent_groups() {
-            self.applied_state.borrow_mut().attempted(group);
-            self.apply_independent_group(config, group, &mut deferred)
-                .await
-                .with_context(|| format!("{unavailable:#}"))?;
-        }
+        self.apply_independent_groups(config, degraded.groups, &mut deferred)
+            .await
+            .with_context(|| format!("{unavailable:#}"))?;
         let error = unavailable.context(
             "Applied power, fan and thermal settings; voltage boost, rail and clock settings stay pending",
         );
         // New voltage or clock requests cannot take effect, so the change as a
         // whole failed; otherwise only earlier pending settings are still waiting.
-        if new_voltage_request {
+        if degraded.new_voltage_request {
             Err(error)
         } else {
             Err(super::partially_applied(error))
         }
+    }
+
+    /// Writes every independent group even when an earlier one fails, so a
+    /// power limit error cannot leave fan or thermal settings unapplied.
+    async fn apply_independent_groups(
+        &self,
+        config: &GpuConfig,
+        groups: Vec<apply_plan::Group>,
+        deferred: &mut Vec<apply_plan::Group>,
+    ) -> anyhow::Result<()> {
+        let mut errors = Vec::new();
+        for group in groups {
+            self.applied_state.borrow_mut().attempted(group);
+            if let Err(err) = self.apply_independent_group(config, group, deferred).await {
+                errors.push(format!("{err:#}"));
+            }
+        }
+        ensure!(errors.is_empty(), "{}", errors.join("; "));
+        Ok(())
     }
 
     async fn apply_independent_group(
@@ -2052,7 +2067,9 @@ impl GpuController for NvidiaGpuController {
             // Groups that failed with a warning are retried by the next Apply.
             let mut deferred = Vec::new();
             let result: anyhow::Result<()> = async {
-                for step in plan.steps() {
+                self.apply_independent_groups(config, plan.independent_groups(), &mut deferred)
+                    .await?;
+                for step in plan.voltage_steps() {
                     match step {
                         apply_plan::Step::ResetClocks => {
                             self.applied_state
@@ -2089,12 +2106,7 @@ impl GpuController for NvidiaGpuController {
                                     self.apply_clock_settings(config)?;
                                 }
                                 independent => {
-                                    self.apply_independent_group(
-                                        config,
-                                        independent,
-                                        &mut deferred,
-                                    )
-                                    .await?;
+                                    bail!("{independent:?} is not a voltage-coupled group");
                                 }
                             }
                         }
