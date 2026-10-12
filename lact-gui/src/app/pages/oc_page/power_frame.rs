@@ -29,6 +29,7 @@ pub struct PowerFrame {
     power_row: FactoryHashMap<(), AdjustmentRow<()>>,
     performance_frame: relm4::Controller<PerformanceFrame>,
     nvidia_mode: Option<NvidiaPowerCapMode>,
+    loaded_nvidia_mode: Option<NvidiaPowerCapMode>,
 }
 
 #[derive(Debug)]
@@ -120,6 +121,7 @@ impl relm4::Component for PowerFrame {
             performance_frame: PerformanceFrame::launch_default()
                 .forward(sender.output_sender(), |msg| msg),
             nvidia_mode: None,
+            loaded_nvidia_mode: None,
         };
         for row in model.performance_frame.widget().rows() {
             card.content.append(row);
@@ -175,7 +177,10 @@ impl relm4::Component for PowerFrame {
                 self.power = power;
             }
             // Config arrives before the initial stats rebuild; it is not a user edit.
-            PowerFrameMsg::NvidiaMode(mode) => self.nvidia_mode = mode,
+            PowerFrameMsg::NvidiaMode(mode) => {
+                self.nvidia_mode = mode;
+                self.loaded_nvidia_mode = mode;
+            }
             PowerFrameMsg::ToggleNvidiaIoctl(enabled) => {
                 let mode = if enabled {
                     NvidiaPowerCapMode::Ioctl
@@ -264,8 +269,11 @@ impl PowerFrame {
         }
     }
 
+    /// Export only a user change relative to the loaded configuration. Returning
+    /// to the loaded mode leaves a freshly fetched configuration untouched.
     pub fn nvidia_power_cap_mode(&self) -> Option<NvidiaPowerCapMode> {
-        self.nvidia_mode.filter(|_| self.nvidia_mode_available())
+        self.nvidia_mode
+            .filter(|_| self.nvidia_mode_available() && self.nvidia_mode != self.loaded_nvidia_mode)
     }
 }
 

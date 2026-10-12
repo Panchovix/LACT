@@ -8,6 +8,7 @@ use tracing::debug;
 
 pub struct UnixConnection {
     inner: BufReader<UnixStream>,
+    in_flight: bool,
 }
 
 impl UnixConnection {
@@ -16,6 +17,7 @@ impl UnixConnection {
         let inner = UnixStream::connect(path).await?;
         Ok(Box::new(Self {
             inner: BufReader::new(inner),
+            in_flight: false,
         }))
     }
 }
@@ -24,6 +26,7 @@ impl From<UnixStream> for UnixConnection {
     fn from(inner: UnixStream) -> Self {
         Self {
             inner: BufReader::new(inner),
+            in_flight: false,
         }
     }
 }
@@ -38,7 +41,7 @@ impl TryFrom<StdUnixStream> for UnixConnection {
 
 impl DaemonConnection for UnixConnection {
     fn request<'a>(&'a mut self, payload: &'a str) -> BoxFuture<'a, anyhow::Result<String>> {
-        Box::pin(async { request(&mut self.inner, payload).await })
+        Box::pin(async { request(&mut self.inner, payload, &mut self.in_flight).await })
     }
 
     fn new_connection(&self) -> BoxFuture<'_, anyhow::Result<Box<dyn DaemonConnection>>> {

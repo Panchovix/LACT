@@ -9,6 +9,7 @@ use tracing::info;
 
 pub struct TcpConnection {
     inner: BufReader<TcpStream>,
+    in_flight: bool,
 }
 
 impl TcpConnection {
@@ -17,13 +18,14 @@ impl TcpConnection {
         let inner = TcpStream::connect(addr).await?;
         Ok(Box::new(Self {
             inner: BufReader::new(inner),
+            in_flight: false,
         }))
     }
 }
 
 impl DaemonConnection for TcpConnection {
     fn request<'a>(&'a mut self, payload: &'a str) -> BoxFuture<'a, anyhow::Result<String>> {
-        Box::pin(async { request(&mut self.inner, payload).await })
+        Box::pin(async { request(&mut self.inner, payload, &mut self.in_flight).await })
     }
 
     fn new_connection(&self) -> BoxFuture<'_, anyhow::Result<Box<dyn DaemonConnection>>> {

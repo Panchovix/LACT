@@ -29,6 +29,8 @@ tokio = { workspace = true, features = [
     "time",
     "signal",
     "sync",
+    "process",
+    "io-util",
 ] }
 futures = { workspace = true }
 indexmap = { workspace = true }

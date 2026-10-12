@@ -1,5 +1,7 @@
+mod apply_plan;
 mod driver;
 pub mod nvapi;
+mod runtime_controls;
 
 use super::{CommonControllerInfo, FanControlHandle, GpuController};
 use crate::{
@@ -38,6 +40,7 @@ use nvml_wrapper::{
     enums::device::{GpuLockedClocksSetting, PowerMizerMode, UsedGpuMemory},
     error::NvmlError,
 };
+use runtime_controls::RuntimeControls;
 use std::{
     cell::{Cell, RefCell},
     cmp,
@@ -91,11 +94,19 @@ pub struct NvidiaGpuController {
     last_applied_offsets: RefCell<HashMap<Clock, HashMap<PerformanceState, i32>>>,
     last_applied_gpu_locked_clocks: RefCell<Option<(u32, u32)>>,
     last_applied_vram_locked_clocks: RefCell<Option<(u32, u32)>>,
+    // Reset intent for uncertain SETs is separate from successfully applied values.
+    attempted_clock_offsets: RefCell<HashMap<Clock, Vec<PerformanceState>>>,
+    gpu_locked_clocks_attempted: Cell<bool>,
+    vram_locked_clocks_attempted: Cell<bool>,
     // Check if reset is needed to avoid unnecessarily going to nvapi
     vf_curve_written: Cell<bool>,
     voltage_boost_written: Cell<bool>,
     clock_domain_offsets_written: Cell<bool>,
     xbar_ratio_written: Cell<bool>,
+    runtime_controls: Option<RuntimeControls>,
+    applied_state: RefCell<apply_plan::AppliedState>,
+    frequency_recovery_needed: Cell<bool>,
+    frequency_recovery_discovery_needed: Cell<bool>,
 }
 
 impl NvidiaGpuController {
@@ -103,6 +114,7 @@ impl NvidiaGpuController {
         common: CommonControllerInfo,
         nvml: Rc<Nvml>,
         nvapi: Option<Rc<NvApi>>,
+        runtime_helper: Option<crate::config::NvidiaRuntimeHelperConfig>,
     ) -> anyhow::Result<Self> {
         let device = nvml
             .device_by_pci_bus_id(common.pci_slot_name.as_str())
@@ -162,6 +174,16 @@ impl NvidiaGpuController {
             .temperature_threshold(TemperatureThreshold::AcousticCurr)
             .ok();
 
+        let runtime_controls = runtime_helper.map(|config| {
+            RuntimeControls::new(
+                config,
+                lact_schema::NvidiaRuntimeDevice {
+                    uuid: device.uuid().unwrap_or_default(),
+                    bdf: common.pci_slot_name.clone(),
+                },
+            )
+        });
+
         Ok(Self {
             nvml,
             nvapi: nvapi.zip(nvapi_handle),
@@ -174,10 +196,17 @@ impl NvidiaGpuController {
             last_applied_offsets: RefCell::new(HashMap::new()),
             last_applied_gpu_locked_clocks: RefCell::new(None),
             last_applied_vram_locked_clocks: RefCell::new(None),
+            attempted_clock_offsets: RefCell::new(HashMap::new()),
+            gpu_locked_clocks_attempted: Cell::new(false),
+            vram_locked_clocks_attempted: Cell::new(false),
             vf_curve_written: Cell::new(false),
             voltage_boost_written: Cell::new(false),
             clock_domain_offsets_written: Cell::new(false),
             xbar_ratio_written: Cell::new(false),
+            runtime_controls,
+            applied_state: RefCell::new(apply_plan::AppliedState::default()),
+            frequency_recovery_needed: Cell::new(false),
+            frequency_recovery_discovery_needed: Cell::new(false),
         })
     }
 
@@ -468,11 +497,10 @@ impl NvidiaGpuController {
             ),
         )?;
 
+        self.vf_curve_written.set(true);
         unsafe {
             nvapi.clock_client_clk_vf_points_set_control(*handle, control)?;
         }
-
-        self.vf_curve_written.set(true);
 
         Ok(())
     }
@@ -520,10 +548,10 @@ impl NvidiaGpuController {
 
         debug!("applying voltage boost {percent}%");
 
+        self.voltage_boost_written.set(true);
         unsafe {
             nvapi.client_volt_rails_set_control(*handle, percent)?;
         }
-        self.voltage_boost_written.set(true);
 
         let applied = unsafe { nvapi.client_volt_rails_get_control(*handle) }
             .context("Could not verify voltage boost")?;
@@ -669,8 +697,8 @@ impl NvidiaGpuController {
         }
 
         debug!("applying clock domain offsets: {offsets:?}");
-        handle.set_clock_domain_offsets(&offsets)?;
         self.clock_domain_offsets_written.set(true);
+        handle.set_clock_domain_offsets(&offsets)?;
 
         Ok(())
     }
@@ -737,8 +765,8 @@ impl NvidiaGpuController {
         }
 
         debug!("applying GPC to XBAR ratio {percent}%");
-        handle.set_clock_propagation_ratio(f64::from(percent) / 100.0)?;
         self.xbar_ratio_written.set(true);
+        handle.set_clock_propagation_ratio(f64::from(percent) / 100.0)?;
 
         Ok(())
     }
@@ -983,6 +1011,411 @@ fn apply_power_cap(device: &mut Device<'_>, power_cap: Option<f64>) -> anyhow::R
     Ok(())
 }
 
+impl NvidiaGpuController {
+    #[allow(
+        clippy::cast_possible_wrap,
+        clippy::cast_sign_loss,
+        clippy::too_many_lines
+    )]
+    fn apply_clock_settings(&self, config: &GpuConfig) -> anyhow::Result<()> {
+        let mut device = self.device();
+        let clocks = &config.clocks_configuration;
+
+        match (clocks.min_core_clock, clocks.max_core_clock) {
+            (Some(min), Some(max)) => {
+                debug!("applying GPU locked clocks: {min}..{max}");
+                self.gpu_locked_clocks_attempted.set(true);
+                device
+                    .set_gpu_locked_clocks(GpuLockedClocksSetting::Numeric {
+                        min_clock_mhz: min as u32,
+                        max_clock_mhz: max as u32,
+                    })
+                    .context("Could not apply GPU locked clocks")?;
+                self.last_applied_gpu_locked_clocks
+                    .replace(Some((min as u32, max as u32)));
+                self.gpu_locked_clocks_attempted.set(false);
+            }
+            (None, None) => (),
+            _ => bail!("Min and max GPU clock must be set together"),
+        }
+
+        match (clocks.min_memory_clock, clocks.max_memory_clock) {
+            (Some(min), Some(max)) => {
+                debug!("applying VRAM locked clocks: {min}..{max}");
+                self.vram_locked_clocks_attempted.set(true);
+                device
+                    .set_mem_locked_clocks(min as u32, max as u32)
+                    .context("Could not apply VRAM locked clocks")?;
+                self.last_applied_vram_locked_clocks
+                    .replace(Some((min as u32, max as u32)));
+                self.vram_locked_clocks_attempted.set(false);
+            }
+            (None, None) => (),
+            _ => bail!("Min and max VRAM clock must be set together"),
+        }
+
+        for (pstate, offset) in &clocks.gpu_clock_offsets {
+            let pstate = PerformanceState::try_from(*pstate)
+                .map_err(|_| anyhow!("Invalid pstate '{pstate}'"))?;
+            debug!("applying offset {offset} for GPU pstate {pstate:?}");
+            self.remember_offset_attempt(Clock::Graphics, pstate);
+
+            device
+                .set_clock_offset(Clock::Graphics, pstate, *offset)
+                .with_context(|| {
+                    format!("Could not set clock offset {offset} for GPU pstate {pstate:?}")
+                })?;
+            self.last_applied_offsets
+                .borrow_mut()
+                .entry(Clock::Graphics)
+                .or_default()
+                .insert(pstate, *offset);
+            self.clear_offset_attempt(Clock::Graphics, pstate);
+        }
+
+        for (pstate, offset) in &clocks.mem_clock_offsets {
+            let pstate = PerformanceState::try_from(*pstate)
+                .map_err(|_| anyhow!("Invalid pstate '{pstate}'"))?;
+            debug!("applying offset {offset} for VRAM pstate {pstate:?}");
+            self.remember_offset_attempt(Clock::Memory, pstate);
+
+            device
+                .set_clock_offset(Clock::Memory, pstate, *offset)
+                .with_context(|| {
+                    format!("Could not set clock offset {offset} for VRAM pstate {pstate:?}")
+                })?;
+            self.last_applied_offsets
+                .borrow_mut()
+                .entry(Clock::Memory)
+                .or_default()
+                .insert(pstate, *offset);
+            self.clear_offset_attempt(Clock::Memory, pstate);
+        }
+
+        if !clocks.nvidia_gpu_vf_curve.is_empty() {
+            self.apply_vf_curve(&clocks.nvidia_gpu_vf_curve)
+                .context("Could not apply VF curve")?;
+        }
+
+        self.apply_clock_domain_offsets(
+            &clocks.clock_domain_offsets,
+            &clocks.clock_domain_voltage_offsets,
+        )
+        .context("Could not apply clock domain offsets")?;
+
+        if let Some(percent) = clocks.xbar_ratio {
+            self.apply_xbar_ratio(percent)
+                .context("Could not apply XBAR ratio")?;
+        }
+
+        Ok(())
+    }
+
+    fn remember_offset_attempt(&self, clock: Clock, pstate: PerformanceState) {
+        let mut attempted = self.attempted_clock_offsets.borrow_mut();
+        let states = attempted.entry(clock).or_default();
+        if !states.contains(&pstate) {
+            states.push(pstate);
+        }
+    }
+
+    fn clear_offset_attempt(&self, clock: Clock, pstate: PerformanceState) {
+        if let Some(states) = self.attempted_clock_offsets.borrow_mut().get_mut(&clock) {
+            states.retain(|state| *state != pstate);
+        }
+    }
+
+    fn apply_boost_setting(&self, config: &GpuConfig) -> anyhow::Result<()> {
+        match config.clocks_configuration.voltage_boost {
+            Some(percent) => self
+                .apply_voltage_boost(percent)
+                .context("Could not apply voltage boost"),
+            None if self.voltage_boost_written.get() => self
+                .reset_voltage_boost()
+                .context("Could not reset voltage boost"),
+            None => Ok(()),
+        }
+    }
+
+    async fn apply_fan_settings(&self, config: &GpuConfig) -> anyhow::Result<()> {
+        let mut device = self.device();
+        if config.fan_control_enabled {
+            let settings = config
+                .fan_control_settings
+                .as_ref()
+                .context("Fan control enabled with no settings")?;
+            match settings.mode {
+                FanControlMode::Static => {
+                    self.stop_fan_control()
+                        .await
+                        .context("Could not reset fan control")?;
+
+                    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                    let speed = (settings.static_speed * 100.0) as u32;
+
+                    let fan_count = device.num_fans().context("Could not get fan count")?;
+                    for fan in 0..fan_count {
+                        device
+                            .set_fan_speed(fan, speed)
+                            .context("Could not reset fan speed to default")?;
+                    }
+                }
+
+                FanControlMode::Curve => {
+                    let (min_speed, max_speed) = device
+                        .min_max_fan_speed()
+                        .context("Could not get fan speed range")?;
+
+                    for point in settings.curve.0.values() {
+                        #[allow(clippy::cast_possible_truncation)]
+                        if !(min_speed..=max_speed).contains(&((*point * 100.0) as u32)) {
+                            bail!(
+                                "Fan speed {}% outside of the allowed range {min_speed}% to {max_speed}%",
+                                point * 100.0
+                            );
+                        }
+                    }
+
+                    self.start_curve_fan_control_task(settings.curve.clone(), settings.clone())
+                        .await?;
+                }
+            }
+        } else {
+            self.stop_fan_control()
+                .await
+                .context("Could not reset fan control")?;
+        }
+
+        Ok(())
+    }
+
+    fn apply_thermal_settings(&self, config: &GpuConfig) -> anyhow::Result<()> {
+        let device = self.device();
+        if let Some(target_temp_info) = self.get_target_temp()
+            && let Some((min, max)) = target_temp_info.allowed_range
+        {
+            if let Some(target_temp) = config.nvidia_thermal_options.target_temperature {
+                let target_temp = target_temp.clamp(min, max);
+
+                if target_temp_info.current != target_temp {
+                    debug!("setting target temperature to {target_temp}");
+                    device
+                        .set_temperature_threshold(
+                            TemperatureThreshold::AcousticCurr,
+                            target_temp.cast_signed(),
+                        )
+                        .context("Could not set target temperature")?;
+                }
+            } else {
+                self.reset_target_temp()
+                    .context("Could not reset target temperature")?;
+            }
+        }
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn reset_frequency_basics(&self, discovery: bool) -> anyhow::Result<()> {
+        let mut device = self.device();
+
+        let mut pstates = match device.supported_performance_states() {
+            Ok(states) => states,
+            Err(error) if discovery => {
+                return Err(error)
+                    .context("Could not discover frequency states for profile recovery");
+            }
+            Err(_) => Vec::new(),
+        };
+        for pstate in self
+            .last_applied_offsets
+            .borrow()
+            .values()
+            .flat_map(|offsets| offsets.keys())
+        {
+            if !pstates.contains(pstate) {
+                pstates.push(*pstate);
+            }
+        }
+        for pstate in self.attempted_clock_offsets.borrow().values().flatten() {
+            if !pstates.contains(pstate) {
+                pstates.push(*pstate);
+            }
+        }
+        for pstate in pstates {
+            for clock_type in [Clock::Graphics, Clock::Memory] {
+                let attempted = self
+                    .last_applied_offsets
+                    .borrow()
+                    .get(&clock_type)
+                    .is_some_and(|offsets| offsets.contains_key(&pstate));
+                let uncertain = self
+                    .attempted_clock_offsets
+                    .borrow()
+                    .get(&clock_type)
+                    .is_some_and(|states| states.contains(&pstate));
+                let current = match device.clock_offset(clock_type, pstate) {
+                    Ok(offset) => Some(offset),
+                    Err(error) if discovery => return Err(error).with_context(|| {
+                        format!("Could not discover {clock_type:?} pstate {pstate:?} offset for profile recovery")
+                    }),
+                    Err(_) => None,
+                };
+                if discovery {
+                    let offset = current
+                        .as_ref()
+                        .context("Missing discovered frequency offset")?;
+                    ensure!(
+                        offset.min_clock_offset_mhz <= 0 && offset.max_clock_offset_mhz >= 0,
+                        "Zero frequency offset is outside the discovered {clock_type:?} pstate {pstate:?} range"
+                    );
+                }
+                // An unsuccessful GET must not hide a SET we already attempted.
+                if discovery
+                    || attempted
+                    || uncertain
+                    || current.is_some_and(|offset| offset.clock_offset_mhz != 0)
+                {
+                    debug!("resetting clock offset for {clock_type:?} pstate {pstate:?}");
+                    device
+                        .set_clock_offset(clock_type, pstate, 0)
+                        .with_context(|| {
+                            format!("Could not reset {clock_type:?} pstate {pstate:?}")
+                        })?;
+                }
+                self.clear_offset_attempt(clock_type, pstate);
+                if let Some(offsets) = self.last_applied_offsets.borrow_mut().get_mut(&clock_type) {
+                    offsets.remove(&pstate);
+                }
+            }
+        }
+
+        if discovery
+            || self.last_applied_gpu_locked_clocks.borrow().is_some()
+            || self.gpu_locked_clocks_attempted.get()
+        {
+            if discovery {
+                let (min, max) = device
+                    .min_max_clock_of_pstate(Clock::Graphics, PerformanceState::Zero)
+                    .context("Could not discover locked-clock range for profile recovery")?;
+                ensure!(min <= max, "Invalid discovered locked-clock range");
+            }
+            device
+                .reset_gpu_locked_clocks()
+                .context("Could not reset locked GPU clocks")?;
+            self.last_applied_gpu_locked_clocks.take();
+            self.gpu_locked_clocks_attempted.set(false);
+        }
+
+        if discovery
+            || self.last_applied_vram_locked_clocks.borrow().is_some()
+            || self.vram_locked_clocks_attempted.get()
+        {
+            if discovery {
+                let (min, max) = device
+                    .min_max_clock_of_pstate(Clock::Memory, PerformanceState::Zero)
+                    .context("Could not discover locked-clock range for profile recovery")?;
+                ensure!(min <= max, "Invalid discovered locked-clock range");
+            }
+            device
+                .reset_mem_locked_clocks()
+                .context("Could not reset locked GPU clocks")?;
+            self.last_applied_vram_locked_clocks.take();
+            self.vram_locked_clocks_attempted.set(false);
+        }
+
+        if apply_plan::frequency_reset_required(
+            self.vf_curve_written.get(),
+            discovery,
+            self.nvapi.is_some(),
+        ) {
+            self.reset_vf_curve()
+                .context("Could not reset VF curve frequency offsets")?;
+        }
+
+        Ok(())
+    }
+
+    fn reset_frequency_settings(&self) -> anyhow::Result<()> {
+        let discovery = self.frequency_recovery_discovery_needed.get();
+        self.reset_frequency_basics(discovery)?;
+        if apply_plan::frequency_reset_required(
+            self.clock_domain_offsets_written.get(),
+            discovery,
+            self.driver_handle.is_some(),
+        ) {
+            let handle = self
+                .driver_handle
+                .as_ref()
+                .context("Nvidia driver interface not available")?;
+            let offsets = apply_plan::frequency_reset_offsets(handle.get_clock_domains()?);
+            if !offsets.is_empty() {
+                handle.set_clock_domain_offsets(&offsets).context(
+                    "Could not compensate domain frequencies while preserving MSVDD demands",
+                )?;
+                apply_plan::verify_frequency_reset(&offsets, &handle.get_clock_domains()?)?;
+            }
+        }
+
+        let discover_ratio = if discovery {
+            match &self.driver_handle {
+                Some(handle) => handle.get_clock_propagation_ratio()?.is_some(),
+                None => false,
+            }
+        } else {
+            false
+        };
+        if self.xbar_ratio_written.get() || discover_ratio {
+            self.reset_xbar_ratio()
+                .context("Could not reset XBAR ratio")?;
+        }
+
+        Ok(())
+    }
+
+    async fn recover_runtime_controls(&self, explicit_restore: bool) -> anyhow::Result<()> {
+        if let Some(runtime) = &self.runtime_controls {
+            if explicit_restore && runtime.has_unknown_profile_transaction().await? {
+                self.frequency_recovery_discovery_needed.set(true);
+                self.frequency_recovery_needed.set(true);
+            }
+            self.complete_frequency_recovery()?;
+            runtime.recover_pending(explicit_restore).await?;
+        } else {
+            self.complete_frequency_recovery()?;
+        }
+        Ok(())
+    }
+
+    fn complete_frequency_recovery(&self) -> anyhow::Result<()> {
+        apply_plan::recover_frequency_if_needed(&self.frequency_recovery_needed, || {
+            self.applied_state
+                .borrow_mut()
+                .invalidate(apply_plan::Group::Clocks);
+            self.reset_frequency_settings()?;
+            self.frequency_recovery_discovery_needed.set(false);
+            Ok(())
+        })
+    }
+
+    fn reset_clock_settings(&self, reset_boost: bool) -> anyhow::Result<()> {
+        self.reset_frequency_basics(false)?;
+        if self.clock_domain_offsets_written.get() {
+            self.reset_clock_domain_offsets()
+                .context("Could not reset clock domain voltage demands")?;
+        }
+        if self.xbar_ratio_written.get() {
+            self.reset_xbar_ratio()
+                .context("Could not reset XBAR ratio")?;
+        }
+        if reset_boost && self.voltage_boost_written.get() {
+            self.reset_voltage_boost()
+                .context("Could not reset voltage boost")?;
+        }
+        Ok(())
+    }
+}
+
 impl GpuController for NvidiaGpuController {
     fn controller_type(&self) -> &'static str {
         "nvidia"
@@ -1020,6 +1453,10 @@ impl GpuController for NvidiaGpuController {
             let driver_handle = self.driver_handle.as_ref();
 
             DeviceInfo {
+                nvidia_runtime: match &self.runtime_controls {
+                    Some(runtime) => Some(runtime.status().await),
+                    None => None,
+                },
                 pci_info: Some(self.common.pci_info.clone()),
                 api_info,
                 driver: format!(
@@ -1456,253 +1893,153 @@ impl GpuController for NvidiaGpuController {
         Err(anyhow!("Not supported on Nvidia"))
     }
 
-    #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+    #[allow(clippy::too_many_lines)]
     fn apply_config<'a>(&'a self, config: &'a GpuConfig) -> LocalBoxFuture<'a, anyhow::Result<()>> {
         Box::pin(async {
-            let mut device = self.device();
-
-            if config.nvidia_power_cap_mode == lact_schema::config::NvidiaPowerCapMode::Ioctl {
-                driver::power_limit::apply(self.driver_handle.as_ref(), &device, config.power_cap)?;
-            } else {
-                driver::power_limit::ensure_native_range(&device, config.power_cap)?;
-                apply_power_cap(&mut device, config.power_cap)?;
+            runtime_controls::validate_settings(config.nvidia_rail_controls.as_ref())?;
+            match &self.runtime_controls {
+                Some(runtime) => runtime.validate(config.nvidia_rail_controls.as_ref())?,
+                None => ensure!(
+                    config.nvidia_rail_controls.is_none(),
+                    "NVIDIA runtime helper is not configured"
+                ),
             }
-            apply_power_mizer_mode(&mut device, config.power_mizer_mode)?;
-
-            self.reset_clocks()?;
-
-            let clocks = &config.clocks_configuration;
-
-            match (clocks.min_core_clock, clocks.max_core_clock) {
-                (Some(min), Some(max)) => {
-                    debug!("applying GPU locked clocks: {min}..{max}");
-                    device
-                        .set_gpu_locked_clocks(GpuLockedClocksSetting::Numeric {
-                            min_clock_mhz: min as u32,
-                            max_clock_mhz: max as u32,
-                        })
-                        .context("Could not apply GPU locked clocks")?;
-                    self.last_applied_gpu_locked_clocks
-                        .replace(Some((min as u32, max as u32)));
-                }
-                (None, None) => (),
-                _ => bail!("Min and max GPU clock must be set together"),
-            }
-
-            match (clocks.min_memory_clock, clocks.max_memory_clock) {
-                (Some(min), Some(max)) => {
-                    debug!("applying VRAM locked clocks: {min}..{max}");
-                    device
-                        .set_mem_locked_clocks(min as u32, max as u32)
-                        .context("Could not apply VRAM locked clocks")?;
-                    self.last_applied_vram_locked_clocks
-                        .replace(Some((min as u32, max as u32)));
-                }
-                (None, None) => (),
-                _ => bail!("Min and max VRAM clock must be set together"),
-            }
-
-            for (pstate, offset) in &clocks.gpu_clock_offsets {
-                let pstate = PerformanceState::try_from(*pstate)
-                    .map_err(|_| anyhow!("Invalid pstate '{pstate}'"))?;
-                debug!("applying offset {offset} for GPU pstate {pstate:?}");
-                device
-                    .set_clock_offset(Clock::Graphics, pstate, *offset)
-                    .with_context(|| {
-                        format!("Could not set clock offset {offset} for GPU pstate {pstate:?}")
-                    })?;
-
-                self.last_applied_offsets
-                    .borrow_mut()
-                    .entry(Clock::Graphics)
-                    .or_default()
-                    .insert(pstate, *offset);
-            }
-
-            for (pstate, offset) in &clocks.mem_clock_offsets {
-                let pstate = PerformanceState::try_from(*pstate)
-                    .map_err(|_| anyhow!("Invalid pstate '{pstate}'"))?;
-                debug!("applying offset {offset} for VRAM pstate {pstate:?}");
-                device
-                    .set_clock_offset(Clock::Memory, pstate, *offset)
-                    .with_context(|| {
-                        format!("Could not set clock offset {offset} for VRAM pstate {pstate:?}")
-                    })?;
-
-                self.last_applied_offsets
-                    .borrow_mut()
-                    .entry(Clock::Memory)
-                    .or_default()
-                    .insert(pstate, *offset);
-            }
-
-            if !clocks.nvidia_gpu_vf_curve.is_empty() {
-                self.apply_vf_curve(&clocks.nvidia_gpu_vf_curve)
-                    .context("Could not apply VF curve")?;
-            }
-
-            self.apply_clock_domain_offsets(
-                &clocks.clock_domain_offsets,
-                &clocks.clock_domain_voltage_offsets,
-            )
-            .context("Could not apply clock domain offsets")?;
-
-            if let Some(percent) = clocks.xbar_ratio {
-                self.apply_xbar_ratio(percent)
-                    .context("Could not apply XBAR ratio")?;
-            }
-
-            if let Some(percent) = clocks.voltage_boost
-                && let Err(err) = self.apply_voltage_boost(percent)
-            {
-                warn!("could not apply voltage boost: {err:#}");
-
-                if self.voltage_boost_written.get()
-                    && let Err(err) = self.reset_voltage_boost()
-                {
-                    warn!("could not reset voltage boost: {err:#}");
-                }
-            }
-
-            if config.fan_control_enabled {
-                let settings = config
-                    .fan_control_settings
-                    .as_ref()
-                    .context("Fan control enabled with no settings")?;
-                match settings.mode {
-                    FanControlMode::Static => {
-                        self.stop_fan_control()
-                            .await
-                            .context("Could not reset fan control")?;
-
-                        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-                        let speed = (settings.static_speed * 100.0) as u32;
-
-                        let fan_count = device.num_fans().context("Could not get fan count")?;
-                        for fan in 0..fan_count {
-                            device
-                                .set_fan_speed(fan, speed)
-                                .context("Could not reset fan speed to default")?;
+            self.recover_runtime_controls(config.nvidia_rail_controls.is_none())
+                .await?;
+            let plan = self.applied_state.borrow().plan(config);
+            let mut transaction = None;
+            let result: anyhow::Result<()> = async {
+                for step in plan.steps() {
+                    match step {
+                        apply_plan::Step::ResetClocks => {
+                            self.applied_state
+                                .borrow_mut()
+                                .attempted(apply_plan::Group::Clocks);
+                            self.reset_clock_settings(false)?;
                         }
-                    }
-
-                    FanControlMode::Curve => {
-                        let (min_speed, max_speed) = device
-                            .min_max_fan_speed()
-                            .context("Could not get fan speed range")?;
-
-                        for point in settings.curve.0.values() {
-                            #[allow(clippy::cast_possible_truncation)]
-                            if !(min_speed..=max_speed).contains(&((*point * 100.0) as u32)) {
-                                bail!(
-                                    "Fan speed {}% outside of the allowed range {min_speed}% to {max_speed}%",
-                                    point * 100.0
-                                );
+                        apply_plan::Step::Apply(group) => {
+                            self.applied_state.borrow_mut().attempted(group);
+                            match group {
+                                apply_plan::Group::PowerCap => {
+                                    let mut device = self.device();
+                                    if config.nvidia_power_cap_mode
+                                        == lact_schema::config::NvidiaPowerCapMode::Ioctl
+                                    {
+                                        driver::power_limit::apply(
+                                            self.driver_handle.as_ref(),
+                                            &device,
+                                            config.power_cap,
+                                        )?;
+                                    } else {
+                                        driver::power_limit::ensure_native_range(
+                                            &device,
+                                            config.power_cap,
+                                        )?;
+                                        apply_power_cap(&mut device, config.power_cap)?;
+                                    }
+                                }
+                                apply_plan::Group::PowerMizer => apply_power_mizer_mode(
+                                    &mut self.device(),
+                                    config.power_mizer_mode,
+                                )?,
+                                apply_plan::Group::Boost => self.apply_boost_setting(config)?,
+                                apply_plan::Group::Rails => {
+                                    if let Some(runtime) = &self.runtime_controls {
+                                        transaction = Some(
+                                            runtime
+                                                .stage(config.nvidia_rail_controls.as_ref())
+                                                .await?,
+                                        );
+                                    }
+                                }
+                                apply_plan::Group::Clocks => {
+                                    if transaction
+                                        .as_ref()
+                                        .is_some_and(|transaction| transaction.is_staged())
+                                    {
+                                        // Persist before the first frequency SET, including a partial failure.
+                                        self.frequency_recovery_needed.set(true);
+                                    }
+                                    self.apply_clock_settings(config)?;
+                                }
+                                apply_plan::Group::Fans => self.apply_fan_settings(config).await?,
+                                apply_plan::Group::Thermal => {
+                                    self.apply_thermal_settings(config)?
+                                }
                             }
                         }
-
-                        self.start_curve_fan_control_task(settings.curve.clone(), settings.clone())
-                            .await?;
                     }
                 }
-            } else {
-                self.stop_fan_control()
-                    .await
-                    .context("Could not reset fan control")?;
-            }
-
-            if let Some(target_temp_info) = self.get_target_temp()
-                && let Some((min, max)) = target_temp_info.allowed_range
-            {
-                if let Some(target_temp) = config.nvidia_thermal_options.target_temperature {
-                    let target_temp = target_temp.clamp(min, max);
-
-                    if target_temp_info.current != target_temp {
-                        debug!("setting target temperature to {target_temp}");
-                        if let Err(err) = device.set_temperature_threshold(
-                            TemperatureThreshold::AcousticCurr,
-                            target_temp.cast_signed(),
-                        ) {
-                            warn!("Could not set target temperature: {err:#}");
-                        }
-                    }
-                } else if let Err(err) = self.reset_target_temp() {
-                    warn!("could not reset target temperature: {err:#}");
+                if let (Some(runtime), Some(transaction)) = (&self.runtime_controls, &transaction) {
+                    runtime.commit(transaction).await?;
                 }
+                Ok(())
             }
-
+            .await;
+            if let Err(error) = result {
+                // Compensate attempted frequencies while keeping the staged rail
+                // policies, boost and MSVDD demands. Zero is a software baseline;
+                // it is not guaranteed to lower the GPU's physical frequency.
+                if let Err(recovery) = self.complete_frequency_recovery() {
+                    return Err(error.context(format!("NVIDIA frequency compensation unconfirmed; rail checkpoint retained: {recovery:#}")));
+                }
+                // Only after frequency compensation may the staged rails be rolled back.
+                if let (Some(runtime), Some(transaction)) = (&self.runtime_controls, &transaction)
+                    && let Err(recovery) = runtime.rollback(transaction).await
+                {
+                    return Err(
+                        error.context(format!("NVIDIA rail rollback unconfirmed: {recovery:#}"))
+                    );
+                }
+                return Err(error);
+            }
+            self.frequency_recovery_needed.set(false);
+            self.frequency_recovery_discovery_needed.set(false);
+            self.applied_state.borrow_mut().complete(config);
             Ok(())
         })
     }
 
-    fn reset_clocks(&self) -> anyhow::Result<()> {
-        let mut device = self.device();
-
-        if let Ok(supported_pstates) = device.supported_performance_states() {
-            for pstate in supported_pstates {
-                for clock_type in [Clock::Graphics, Clock::Memory] {
-                    if let Ok(current_offset) = device.clock_offset(clock_type, pstate)
-                        && (current_offset.clock_offset_mhz != 0
-                            || self
-                                .last_applied_offsets
-                                .borrow()
-                                .get(&clock_type)
-                                .and_then(|applied_offsets| applied_offsets.get(&pstate))
-                                .is_some_and(|offset| *offset != 0))
-                    {
-                        debug!("resetting clock offset for {clock_type:?} pstate {pstate:?}");
-                        if let Err(err) = device.set_clock_offset(clock_type, pstate, 0) {
-                            warn!("could not reset {clock_type:?} pstate {pstate:?}: {err:#}");
-                        }
-                    }
-
-                    if let Some(applied_offsets) =
-                        self.last_applied_offsets.borrow_mut().get_mut(&clock_type)
-                    {
-                        applied_offsets.remove(&pstate);
-                    }
-                }
+    fn restore_runtime_controls(&self) -> LocalBoxFuture<'_, anyhow::Result<()>> {
+        async {
+            self.applied_state
+                .borrow_mut()
+                .invalidate(apply_plan::Group::Rails);
+            self.recover_runtime_controls(true).await?;
+            if let Some(runtime) = &self.runtime_controls {
+                runtime.apply(None).await?;
             }
+            Ok(())
         }
+        .boxed_local()
+    }
 
-        if self.last_applied_gpu_locked_clocks.borrow().is_some() {
-            device
-                .reset_gpu_locked_clocks()
-                .context("Could not reset locked GPU clocks")?;
-            self.last_applied_gpu_locked_clocks.take();
-        }
+    fn prepare_reset(&self) -> LocalBoxFuture<'_, anyhow::Result<()>> {
+        async { self.recover_runtime_controls(false).await }.boxed_local()
+    }
 
-        if self.last_applied_vram_locked_clocks.borrow().is_some() {
-            device
-                .reset_mem_locked_clocks()
-                .context("Could not reset locked GPU clocks")?;
-            self.last_applied_vram_locked_clocks.take();
-        }
-
-        if self.vf_curve_written.get() {
-            self.reset_vf_curve().context("Could not reset VF curve")?;
-        }
-
-        if self.clock_domain_offsets_written.get() {
-            self.reset_clock_domain_offsets()
-                .context("Could not reset clock domain offsets")?;
-        }
-
-        if self.xbar_ratio_written.get() {
-            self.reset_xbar_ratio()
-                .context("Could not reset XBAR ratio")?;
-        }
-
-        if self.voltage_boost_written.get() {
-            self.reset_voltage_boost()
-                .context("Could not reset voltage boost")?;
-        }
-
-        Ok(())
+    fn reset_clocks(&self) -> anyhow::Result<()> {
+        ensure!(
+            !self.frequency_recovery_needed.get(),
+            "NVIDIA frequency compensation must complete before resetting voltage settings"
+        );
+        self.applied_state
+            .borrow_mut()
+            .invalidate(apply_plan::Group::Clocks);
+        self.applied_state
+            .borrow_mut()
+            .invalidate(apply_plan::Group::Boost);
+        self.reset_clock_settings(true)
     }
 
     fn cleanup(&self) -> LocalBoxFuture<'_, ()> {
         async {
+            self.applied_state.borrow_mut().invalidate_all();
+            if let Err(err) = self.restore_runtime_controls().await {
+                error!("could not restore NVIDIA runtime controls during cleanup: {err:#}");
+                // Preserve the unresolved helper state and avoid further changes.
+                return;
+            }
             if let Some((fan_notify, fan_handle)) = self.fan_control_handle.take() {
                 debug!("sending stop notification to old fan control task");
                 fan_notify.notify_one();

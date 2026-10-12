@@ -28,6 +28,45 @@ fn experimental_power_mode_is_explicit_and_restores_native_bounds() {
     assert_eq!(cap_min(), 250.0);
     assert_eq!(frame.model().get_user_cap(), None);
 
+    // A stale NVML display must not overwrite a freshly fetched IOCTL config
+    // while another panel applies a REL-only edit.
+    let fresh = lact_schema::config::GpuConfig {
+        nvidia_power_cap_mode: NvidiaPowerCapMode::Ioctl,
+        power_cap: Some(230.0),
+        fan_control_enabled: true,
+        nvidia_rail_controls: Some(lact_schema::NvidiaRailControls {
+            nvvdd: lact_schema::NvidiaRailSettings {
+                max_voltage_uv: Some(1125000),
+                overvoltage_uv: Some(1150000),
+                ..Default::default()
+            },
+            msvdd: lact_schema::NvidiaRailSettings {
+                min_voltage_uv: Some(800000),
+                ..Default::default()
+            },
+        }),
+        ..Default::default()
+    };
+    let mut merged = fresh.clone();
+    merged
+        .nvidia_rail_controls
+        .as_mut()
+        .unwrap()
+        .nvvdd
+        .max_voltage_uv = Some(1100000);
+    let expected = merged.clone();
+    if let Some(cap) = frame.model().get_user_cap() {
+        merged.power_cap = Some(cap);
+    }
+    if let Some(mode) = frame.model().nvidia_power_cap_mode() {
+        merged.nvidia_power_cap_mode = mode;
+    }
+    assert_eq!(
+        merged, expected,
+        "untouched power controls changed a REL-only merge"
+    );
+    assert_eq!(frame.model().nvidia_power_cap_mode(), None);
+
     // The factory recreates the power limit row; it must stay above the toggle.
     let list = frame.model().power_row.widget().clone();
     let toggle = (0..)
@@ -41,6 +80,10 @@ fn experimental_power_mode_is_explicit_and_restores_native_bounds() {
     frame.widgets().ioctl_toggle.set_active(true);
     drain();
     assert_eq!(cap_min(), 30.0);
+    assert_eq!(
+        frame.model().nvidia_power_cap_mode(),
+        Some(NvidiaPowerCapMode::Ioctl)
+    );
     frame
         .model()
         .power_row
@@ -51,6 +94,7 @@ fn experimental_power_mode_is_explicit_and_restores_native_bounds() {
     drain();
     assert_eq!(cap_min(), 250.0);
     assert_eq!(frame.model().get_user_cap(), Some(250.0));
+    assert_eq!(frame.model().nvidia_power_cap_mode(), None);
 
     // Restore an opted-in profile and its lower cap together, without
     // treating programmatic checkbox updates as user mode changes.
@@ -66,10 +110,20 @@ fn experimental_power_mode_is_explicit_and_restores_native_bounds() {
     frame.emit(PowerFrameMsg::Reset);
     drain();
     assert_eq!(frame.model().get_user_cap(), Some(300.0));
+    assert_eq!(frame.model().nvidia_power_cap_mode(), None);
+    frame.widgets().ioctl_toggle.set_active(false);
+    drain();
     assert_eq!(
         frame.model().nvidia_power_cap_mode(),
-        Some(NvidiaPowerCapMode::Ioctl)
+        Some(NvidiaPowerCapMode::Nvml)
     );
+    frame.widgets().ioctl_toggle.set_active(true);
+    drain();
+    assert_eq!(frame.model().nvidia_power_cap_mode(), None);
+    frame.emit(PowerFrameMsg::PowerStats(native_stats.clone()));
+    drain();
+    assert!(frame.widgets().ioctl_toggle.is_active());
+    assert_eq!(frame.model().nvidia_power_cap_mode(), None);
 
     // Other drivers never see the toggle or report a mode.
     frame.emit(PowerFrameMsg::NvidiaMode(None));
