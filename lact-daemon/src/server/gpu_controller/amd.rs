@@ -1437,10 +1437,17 @@ impl GpuController for AmdGpuController {
 
     fn cleanup(&self) -> LocalBoxFuture<'_, ()> {
         async {
-            if let Some((fan_notify, fan_handle)) = self.fan_control_handle.take() {
+            let task = self.fan_control_handle.take();
+            if let Some((fan_notify, fan_handle)) = task {
                 debug!("sending stop notification to old fan control task");
                 fan_notify.notify_one();
-                fan_handle.await.unwrap();
+                if let Err(err) = fan_handle.await {
+                    // The failed loop could not hand its fans back by itself.
+                    error!("fan control task failed: {err}");
+                    if let Err(err) = self.release_fan_control().await {
+                        error!("{err:#}");
+                    }
+                }
                 debug!("finished controller cleanup");
             }
         }
