@@ -9,7 +9,7 @@ use std::{
     io::Read,
     os::unix::{fs::MetadataExt, process::CommandExt},
     path::{Path, PathBuf},
-    process::Stdio,
+    process::{ExitStatus, Stdio},
     sync::{
         Arc, LazyLock, PoisonError,
         atomic::{AtomicBool, Ordering},
@@ -22,6 +22,7 @@ use tokio::{
     sync::{Mutex, oneshot},
     time::timeout,
 };
+use tracing::error;
 
 const PROTOCOL_VERSION: u32 = 1;
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
@@ -33,8 +34,10 @@ const REAP_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug)]
 struct HelperUnavailable(anyhow::Error);
 
-/// A failure after a valid response reported pending native recovery: the
-/// helper verifies unrelated CONTROL then, so other groups must still wait.
+/// A failure while native recovery may be pending: a valid response reported
+/// it, a call that could write got no valid response, or a killed helper has
+/// not exited. The helper verifies unrelated CONTROL then, so other groups
+/// must still wait.
 #[derive(Debug)]
 struct RecoveryReported(anyhow::Error);
 
@@ -294,16 +297,20 @@ impl RuntimeControls {
             }))
     }
 
-    /// An unfinished change of this controller, or recovery that a valid
-    /// response reported before or during `operation`, may have left a native
-    /// helper transaction behind, so any failure then stays fail-closed.
+    /// An unfinished change of this controller, recovery outstanding before or
+    /// during `operation`, or a killed helper that has not exited may have left
+    /// native helper state behind, so any failure then stays fail-closed, even
+    /// one that validation reports before any helper call.
     async fn guard_own_pending<T>(
         &self,
         operation: impl Future<Output = anyhow::Result<T>>,
     ) -> anyhow::Result<T> {
         let ours = self.pending.lock().await.is_some();
         operation.await.map_err(|error| {
-            if ours || self.guard.recovery_outstanding.load(Ordering::SeqCst) {
+            if ours
+                || self.guard.recovery_outstanding.load(Ordering::SeqCst)
+                || self.guard.unreaped.load(Ordering::SeqCst)
+            {
                 recovery_reported(error)
             } else {
                 error
@@ -679,11 +686,7 @@ impl RuntimeControls {
             let (result, running) = invoke_process(config, device, request, reap_timeout).await;
             if let Some(mut child) = running {
                 guard.unreaped.store(true, Ordering::SeqCst);
-                let guard = guard.clone();
-                tokio::spawn(async move {
-                    let _ = child.wait().await;
-                    guard.unreaped.store(false, Ordering::SeqCst);
-                });
+                tokio::spawn(reap(guard.clone(), async move { child.wait().await }));
             }
             if let Ok(info) = &result {
                 guard
@@ -695,6 +698,17 @@ impl RuntimeControls {
         rx.await
             .context("NVIDIA runtime helper task was interrupted")
             .and_then(|result| result)
+    }
+}
+
+/// Only a confirmed exit unblocks the GPU: after a failed wait, the killed
+/// helper may still be inside a native call.
+async fn reap(guard: Arc<DeviceGuard>, exit: impl Future<Output = std::io::Result<ExitStatus>>) {
+    match exit.await {
+        Ok(_) => guard.unreaped.store(false, Ordering::SeqCst),
+        Err(err) => error!(
+            "could not reap a killed NVIDIA runtime helper, its GPU stays blocked until lactd restarts: {err}"
+        ),
     }
 }
 
@@ -986,7 +1000,10 @@ pub(super) fn validate_settings(settings: Option<&NvidiaRailControls>) -> anyhow
 #[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
-    use std::{fs, os::unix::fs::PermissionsExt};
+    use std::{
+        fs,
+        os::unix::{fs::PermissionsExt, process::ExitStatusExt},
+    };
     use tempfile::TempDir;
 
     pub(super) const RESPONSE: &str = r#"{"protocol_version":1,"available":true,"device":{"uuid":"GPU-test","bdf":"0000:09:00.0"},"managed":false,"rails":[]}"#;
@@ -1323,9 +1340,35 @@ mod tests {
                 .await
                 .is_err()
         );
+        // Nothing else is pending, and the missing executable fails validation
+        // before any call could notice the killed helper.
+        let mut missing = runtime.reloaded();
+        missing.config.executable = missing.config.state_dir.join("missing-helper");
+        assert!(missing.pending.lock().await.is_none());
+        assert!(!missing.guard.recovery_outstanding.load(Ordering::SeqCst));
+        let error = missing.prepare_apply(None, |_| Ok(())).await.unwrap_err();
+        assert!(!is_unavailable(&error), "{error:#}");
         assert!(!dir.path().join("started").exists());
         runtime.guard.unreaped.store(false, Ordering::SeqCst);
         runtime.prepare_apply(None, |_| Ok(())).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_failed_wait_never_unblocks_a_killed_helper() {
+        let (dir, runtime) = fake(
+            &format!("open(os.path.join(state_dir,'started'),'a').close()\nprint({RESPONSE:?})"),
+            2000,
+        );
+        runtime.guard.unreaped.store(true, Ordering::SeqCst);
+        reap(runtime.guard.clone(), async {
+            Err(std::io::Error::other("wait failed"))
+        })
+        .await;
+        assert!(runtime.apply(None).await.is_err());
+        assert!(!dir.path().join("started").exists());
+        reap(runtime.guard.clone(), async { Ok(ExitStatus::from_raw(0)) }).await;
+        runtime.apply(None).await.unwrap();
+        assert!(dir.path().join("started").exists());
     }
 
     #[tokio::test]
