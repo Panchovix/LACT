@@ -40,7 +40,7 @@ use nvml_wrapper::{
     enums::device::{GpuLockedClocksSetting, PowerMizerMode, UsedGpuMemory},
     error::NvmlError,
 };
-use runtime_controls::{RailDeferral, RailPreparation, RuntimeControls};
+use runtime_controls::{PreparedRails, RailDeferral, RailPreparation, RuntimeControls};
 use std::{
     cell::{Cell, RefCell},
     cmp,
@@ -1487,10 +1487,7 @@ impl NvidiaGpuController {
 
     /// Resolve real recovery first. Ordinary rail unavailability defers only
     /// Rails and never prevents applying clocks, VRAM or the other groups.
-    async fn prepare_runtime_controls(
-        &self,
-        config: &GpuConfig,
-    ) -> anyhow::Result<RailPreparation> {
+    async fn prepare_runtime_controls(&self, config: &GpuConfig) -> anyhow::Result<PreparedRails> {
         let settings = config.nvidia_rail_controls.as_ref();
         let result = match &self.runtime_controls {
             Some(runtime) => {
@@ -1503,14 +1500,14 @@ impl NvidiaGpuController {
             ))),
             None => {
                 self.complete_frequency_recovery()?;
-                return Ok(RailPreparation::Ready);
+                return Ok(PreparedRails::ready());
             }
         };
         match result {
             Ok(decision) => Ok(decision),
             Err(error) if runtime_controls::is_unavailable(&error) => {
                 self.complete_frequency_recovery()?;
-                Ok(RailPreparation::Deferred(RailDeferral::unavailable(
+                Ok(PreparedRails::deferred(RailDeferral::unavailable(
                     settings,
                     format!("{error:#}"),
                 )))
@@ -1596,6 +1593,10 @@ impl HelperOutage {
 impl GpuController for NvidiaGpuController {
     fn controller_type(&self) -> &'static str {
         "nvidia"
+    }
+
+    fn supports_incremental_profile_switch(&self) -> bool {
+        true
     }
 
     fn controller_info(&self) -> &CommonControllerInfo {
@@ -2082,10 +2083,11 @@ impl GpuController for NvidiaGpuController {
         Box::pin(async {
             runtime_controls::validate_settings(config.nvidia_rail_controls.as_ref())?;
             let preparation = self.prepare_runtime_controls(config).await?;
-            let mut rail_deferral = match preparation {
+            let mut rail_deferral = match &preparation.decision {
                 RailPreparation::Ready => None,
-                RailPreparation::Deferred(reason) => Some(reason),
+                RailPreparation::Deferred(reason) => Some(reason.clone()),
             };
+            let mut preparation = Some(preparation);
             if rail_deferral.is_some() {
                 self.deferred_rails.replace(rail_deferral.clone());
             }
@@ -2120,7 +2122,12 @@ impl GpuController for NvidiaGpuController {
                                 apply_plan::Group::Rails => {
                                     if let Some(runtime) = &self.runtime_controls {
                                         let staged = runtime
-                                            .stage(config.nvidia_rail_controls.as_ref())
+                                            .stage_prepared(
+                                                config.nvidia_rail_controls.as_ref(),
+                                                preparation
+                                                    .take()
+                                                    .context("Rail preparation already consumed")?,
+                                            )
                                             .await?;
                                         if let Some(reason) = staged.deferral() {
                                             rail_deferral = Some(reason.clone());
@@ -2201,7 +2208,8 @@ impl GpuController for NvidiaGpuController {
             self.applied_state
                 .borrow_mut()
                 .invalidate(apply_plan::Group::Rails);
-            match self.prepare_runtime_controls(&GpuConfig::default()).await? {
+            let preparation = self.prepare_runtime_controls(&GpuConfig::default()).await?;
+            match &preparation.decision {
                 RailPreparation::Deferred(reason) => {
                     self.deferred_rails.replace(Some(reason.clone()));
                     return Err(super::partially_applied(anyhow!(
@@ -2212,7 +2220,7 @@ impl GpuController for NvidiaGpuController {
                 RailPreparation::Ready => (),
             }
             if let Some(runtime) = &self.runtime_controls {
-                let transaction = runtime.stage(None).await?;
+                let transaction = runtime.stage_prepared(None, preparation).await?;
                 if let Some(reason) = transaction.deferral() {
                     self.deferred_rails.replace(Some(reason.clone()));
                     return Err(super::partially_applied(anyhow!(

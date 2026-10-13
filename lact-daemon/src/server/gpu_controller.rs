@@ -106,6 +106,12 @@ pub trait GpuController {
 
     fn apply_config<'a>(&'a self, config: &'a GpuConfig) -> LocalBoxFuture<'a, anyhow::Result<()>>;
 
+    /// Apply a complete next profile directly, including releasing settings that
+    /// it removes, without first resetting every group to defaults.
+    fn supports_incremental_profile_switch(&self) -> bool {
+        false
+    }
+
     fn get_stats(&self, gpu_config: Option<&GpuConfig>) -> DeviceStats;
 
     fn get_clocks_info(&self, gpu_config: Option<&GpuConfig>) -> anyhow::Result<ClocksInfo>;

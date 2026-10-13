@@ -408,6 +408,24 @@ This includes restoring the default target temperature after removing a
 configured one: the target read at startup, or just before LACT first changed
 it if it was unreadable then.
 
+Switching profiles also applies NVIDIA settings incrementally when the GPU is
+present in the destination profile. It does not first apply defaults and release
+the same rail controls twice. GPUs omitted from the next profile still undergo
+one default Apply and return their fans to automatic control. Controllers without
+incremental profile support, shutdown and GPU detach retain their normal cleanup. A failed incremental transition still tries
+to return fan control to the driver.
+
+Preparation reuses a fresh helper response within that operation. A compatible
+modern provider can then receive Stage directly, where it rechecks the complete
+bundle before writing. The prepared request is bound to its controller, settings
+and executable identity; it is not a time-based cache of voltage permissions.
+Recovery that changes state requires a new read before preparation can finish.
+Providers advertising `metadata_status: 1` can answer routine recovery checks
+from their durable transaction records without querying the GPU. This capability
+hint is bound to the executable identity; it does not cache voltage values or
+write permissions. Probe and Stage still establish fresh write preconditions,
+and post-recovery verification continues to use a full Status request.
+
 Unsupported or unreadable rail controls defer only the complete rail bundle of
 that GPU. Clock and VRAM settings, voltage boost, power cap, PowerMizer, fans and
 target temperature can still be applied, including new edits and saved profiles

@@ -245,3 +245,424 @@ async fn reported_or_own_unfinished_recovery_is_never_unavailability() {
     assert!(!is_unavailable(&native), "{native:#}");
     assert!(runtime.status().await.recovery_required);
 }
+
+fn modern_profile_fake() -> (tempfile::TempDir, RuntimeControls) {
+    let body = include_str!("runtime_controls_profile_helper.py")
+        .replace("\"profile_transactions\": 1", "\"profile_transactions\": 1, \"rail_probe\": 1")
+        .replace("if r[\"action\"] == \"stage\":", "if r[\"action\"] == \"probe\":\n    if state[\"checkpoint\"]: emit(state[\"checkpoint\"], True)\n    base.update(can_stage=True)\n    emit()\nif r[\"action\"] == \"stage\":");
+    fake(&body, 3000)
+}
+
+#[tokio::test]
+async fn prepared_modern_none_and_some_use_one_status_and_one_probe() {
+    for settings in [None, Some(requested())] {
+        let (dir, runtime) = modern_profile_fake();
+        let prepared = runtime
+            .prepare_apply(settings.as_ref(), |unknown| {
+                assert!(!unknown);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(prepared.modern_ticket.is_some());
+        assert_eq!(actions(&dir), ["status", "probe"]);
+        let transaction = runtime
+            .stage_prepared(settings.as_ref(), prepared)
+            .await
+            .unwrap();
+        runtime.commit(&transaction).await.unwrap();
+        let expected = if settings.is_some() {
+            vec!["status", "probe", "stage", "commit"]
+        } else {
+            vec!["status", "probe", "stage"]
+        };
+        assert_eq!(actions(&dir), expected);
+        assert!(runtime.pending.lock().await.is_none());
+        assert!(!runtime.guard.recovery_outstanding.load(Ordering::SeqCst));
+    }
+}
+
+#[tokio::test]
+async fn prepared_ticket_exec_swap_and_other_controller_use_conservative_preflight() {
+    for swap in [false, true] {
+        let (dir, runtime) = modern_profile_fake();
+        let settings = requested();
+        let prepared = runtime
+            .prepare_apply(Some(&settings), |_| Ok(()))
+            .await
+            .unwrap();
+        let receiver = if swap { &runtime } else { &runtime.reloaded() };
+        if swap {
+            let replacement = dir.path().join("replacement");
+            assert!(
+                std::process::Command::new("install")
+                    .args(["-m700"])
+                    .arg(&runtime.config.executable)
+                    .arg(&replacement)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            fs::rename(replacement, &runtime.config.executable).unwrap();
+        }
+        let transaction = receiver
+            .stage_prepared(Some(&settings), prepared)
+            .await
+            .unwrap();
+        receiver.commit(&transaction).await.unwrap();
+        assert_eq!(
+            actions(&dir),
+            [
+                "status", "probe", "status", "probe", "status", "stage", "commit"
+            ]
+        );
+    }
+}
+
+#[tokio::test]
+async fn prepared_ticket_changed_settings_requires_new_probe() {
+    let (dir, runtime) = modern_profile_fake();
+    let mut settings = requested();
+    let prepared = runtime
+        .prepare_apply(Some(&settings), |_| Ok(()))
+        .await
+        .unwrap();
+    settings.nvvdd.max_voltage_uv = Some(975000);
+    let transaction = runtime
+        .stage_prepared(Some(&settings), prepared)
+        .await
+        .unwrap();
+    runtime.commit(&transaction).await.unwrap();
+    assert_eq!(
+        actions(&dir),
+        [
+            "status", "probe", "status", "probe", "status", "stage", "commit"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn prepared_ticket_cannot_bypass_own_pending_or_shared_recovery() {
+    for condition in 0..3 {
+        let (dir, runtime) = modern_profile_fake();
+        let settings = requested();
+        let prepared = runtime
+            .prepare_apply(Some(&settings), |_| Ok(()))
+            .await
+            .unwrap();
+        if condition == 0 {
+            *runtime.pending.lock().await = Some(RuntimeTransaction {
+                device: runtime.device.clone(),
+                kind: TransactionKind::Profile {
+                    transaction_id: None,
+                    request_id: "a".repeat(64),
+                },
+            });
+        } else if condition == 1 {
+            runtime
+                .guard
+                .recovery_outstanding
+                .store(true, Ordering::SeqCst);
+        } else {
+            runtime.guard.unreaped.store(true, Ordering::SeqCst);
+        }
+        let error = runtime
+            .stage_prepared(Some(&settings), prepared)
+            .await
+            .unwrap_err();
+        assert!(!is_unavailable(&error), "{error:#}");
+        assert_eq!(actions(&dir), ["status", "probe"]);
+        if condition == 0 {
+            assert!(runtime.pending.lock().await.is_some());
+        }
+        if condition == 1 {
+            assert!(runtime.guard.recovery_outstanding.load(Ordering::SeqCst));
+        }
+        if condition == 2 {
+            assert!(runtime.guard.unreaped.load(Ordering::SeqCst));
+        }
+    }
+}
+
+#[tokio::test]
+async fn prepared_unknown_recovery_refreshes_status_after_frequency_then_rollback() {
+    let (dir, runtime) = modern_profile_fake();
+    let transaction = runtime.stage(Some(&requested())).await.unwrap();
+    let restarted = runtime.restarted();
+    fs::write(dir.path().join("calls"), "").unwrap();
+    let blocked = restarted
+        .prepare_apply(None, |unknown| {
+            assert!(unknown);
+            anyhow::bail!("synthetic frequency compensation failure")
+        })
+        .await
+        .unwrap_err();
+    assert!(!is_unavailable(&blocked));
+    assert_eq!(actions(&dir), ["status"]);
+    let prepared = restarted
+        .prepare_apply(None, |unknown| {
+            assert!(unknown);
+            assert!(!actions(&dir).iter().any(|action| action == "rollback"));
+            fs::write(dir.path().join("frequency-compensated"), "yes").unwrap();
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert!(dir.path().join("frequency-compensated").exists());
+    assert_eq!(
+        actions(&dir),
+        ["status", "status", "rollback", "status", "probe"]
+    );
+    assert!(prepared.modern_ticket.is_some());
+    let noop = restarted.stage_prepared(None, prepared).await.unwrap();
+    restarted.commit(&noop).await.unwrap();
+    assert_eq!(actions(&dir).last().unwrap(), "stage");
+    assert!(restarted.pending.lock().await.is_none());
+    assert!(!noop.is_staged());
+    // The original receipt was resolved rather than replaced or re-estimated.
+    assert_eq!(
+        restarted
+            .transaction_status(&transaction)
+            .await
+            .unwrap()
+            .transaction_status
+            .as_deref(),
+        Some("rolled_back")
+    );
+}
+
+#[tokio::test]
+async fn local_frequency_failure_precedes_every_helper_rpc_when_not_releasing() {
+    let (dir, runtime) = modern_profile_fake();
+    let error = runtime
+        .prepare_apply(Some(&requested()), |unknown| {
+            assert!(!unknown);
+            assert!(!dir.path().join("calls").exists());
+            anyhow::bail!("synthetic local frequency recovery failure")
+        })
+        .await
+        .unwrap_err();
+    assert!(!is_unavailable(&error));
+    assert!(!dir.path().join("calls").exists());
+}
+
+#[tokio::test]
+async fn disappeared_executable_defers_prepared_rails_only_without_pending_recovery() {
+    for pending in [false, true] {
+        let (dir, runtime) = modern_profile_fake();
+        let settings = requested();
+        let prepared = runtime
+            .prepare_apply(Some(&settings), |_| Ok(()))
+            .await
+            .unwrap();
+        fs::rename(
+            &runtime.config.executable,
+            dir.path().join("removed-helper"),
+        )
+        .unwrap();
+        if pending {
+            runtime
+                .guard
+                .recovery_outstanding
+                .store(true, Ordering::SeqCst);
+        }
+        let result = runtime.stage_prepared(Some(&settings), prepared).await;
+        if pending {
+            let error = result.unwrap_err();
+            assert!(!is_unavailable(&error), "{error:#}");
+            assert!(runtime.guard.recovery_outstanding.load(Ordering::SeqCst));
+        } else {
+            let transaction = result.unwrap();
+            assert!(transaction.deferral().is_some());
+            runtime.commit(&transaction).await.unwrap();
+            assert!(!runtime.guard.recovery_outstanding.load(Ordering::SeqCst));
+        }
+        assert_eq!(actions(&dir), ["status", "probe"]);
+        assert!(runtime.pending.lock().await.is_none());
+    }
+}
+
+fn metadata_profile_fake() -> (tempfile::TempDir, RuntimeControls) {
+    let body = include_str!("runtime_controls_profile_helper.py")
+        .replace("\"profile_transactions\": 1", "\"profile_transactions\": 1, \"rail_probe\": 1, \"metadata_status\": 1")
+        .replace("if r[\"action\"] == \"stage\":", "if r[\"action\"] == \"probe\":\n    if state[\"checkpoint\"]: emit(state[\"checkpoint\"], True)\n    base.update(can_stage=True)\n    emit()\nif r[\"action\"] == \"stage\":")
+        .replace("if r[\"action\"] == \"status\":", r#"if r["action"] == "metadata":
+    assert r.get("settings") is None
+    if mode in ("metadata_busy", "metadata_busy_and_status_failure"):
+        sys.stderr.write(json.dumps(dict(protocol_version=1, error="BusyError", message="synthetic busy")))
+        sys.exit(2)
+    if mode == "metadata_failure":
+        sys.stderr.write(json.dumps(dict(protocol_version=1, error="UnsupportedError", message="synthetic unsupported metadata")))
+        sys.exit(2)
+    if mode == "metadata_cap_mismatch":
+        base["capabilities"]["metadata_status"] = 0
+    if state["checkpoint"]: emit(state["checkpoint"], True)
+    base["rails"] = []
+    if mode == "metadata_clean_owned":
+        base.update(available=False, managed=True, ownership_unavailable=True)
+    emit()
+if r["action"] == "status":"#)
+        .replace("if mode == \"status_failure\":", "if mode in (\"status_failure\", \"metadata_busy_and_status_failure\"):");
+    fake(&body, 3000)
+}
+
+#[tokio::test]
+async fn metadata_is_negotiated_from_full_status_and_keeps_policy_probe_fresh() {
+    for settings in [None, Some(requested())] {
+        let (dir, runtime) = metadata_profile_fake();
+        for iteration in 0..2 {
+            let prepared = runtime
+                .prepare_apply(settings.as_ref(), |_| Ok(()))
+                .await
+                .unwrap();
+            let transaction = runtime
+                .stage_prepared(settings.as_ref(), prepared)
+                .await
+                .unwrap();
+            runtime.commit(&transaction).await.unwrap();
+            assert!(runtime.pending.lock().await.is_none());
+            assert_eq!(
+                actions(&dir)
+                    .iter()
+                    .filter(|action| *action == "probe")
+                    .count(),
+                iteration + 1
+            );
+        }
+        let expected = if settings.is_some() {
+            vec![
+                "status", "probe", "stage", "commit", "metadata", "probe", "stage", "commit",
+            ]
+        } else {
+            vec!["status", "probe", "stage", "metadata", "probe", "stage"]
+        };
+        assert_eq!(actions(&dir), expected);
+        assert!(!runtime.guard.recovery_outstanding.load(Ordering::SeqCst));
+    }
+}
+
+#[tokio::test]
+async fn gui_status_can_negotiate_metadata_but_executable_change_invalidates_it() {
+    let (dir, runtime) = metadata_profile_fake();
+    assert!(runtime.status().await.available);
+    assert!(runtime.metadata_hint.lock().await.is_some());
+    assert!(runtime.recovery_status().await.unwrap().rails.is_empty());
+    assert_eq!(actions(&dir), ["status", "metadata"]);
+    let replacement = dir.path().join("replacement");
+    assert!(
+        std::process::Command::new("install")
+            .args(["-m700"])
+            .arg(&runtime.config.executable)
+            .arg(&replacement)
+            .status()
+            .unwrap()
+            .success()
+    );
+    fs::rename(replacement, &runtime.config.executable).unwrap();
+    assert!(!runtime.recovery_status().await.unwrap().rails.is_empty());
+    assert_eq!(actions(&dir), ["status", "metadata", "status"]);
+}
+
+#[tokio::test]
+async fn metadata_error_or_capability_mismatch_retries_full_status_exactly_once() {
+    for mode in ["metadata_failure", "metadata_cap_mismatch", "metadata_busy"] {
+        let (dir, runtime) = metadata_profile_fake();
+        runtime.status().await;
+        fs::write(dir.path().join("mode"), mode).unwrap();
+        let info = runtime.recovery_status().await.unwrap();
+        assert!(!info.rails.is_empty());
+        assert_eq!(actions(&dir), ["status", "metadata", "status"]);
+        assert!(!runtime.guard.recovery_outstanding.load(Ordering::SeqCst));
+    }
+}
+
+#[tokio::test]
+async fn refused_metadata_cannot_degrade_when_full_status_retry_also_fails() {
+    let (dir, runtime) = metadata_profile_fake();
+    runtime.status().await;
+    fs::write(dir.path().join("mode"), "metadata_busy_and_status_failure").unwrap();
+    let error = runtime
+        .prepare_apply(Some(&requested()), |_| Ok(()))
+        .await
+        .unwrap_err();
+    assert!(!is_unavailable(&error), "{error:#}");
+    assert_eq!(actions(&dir), ["status", "metadata", "status"]);
+    assert!(runtime.metadata_hint.lock().await.is_none());
+    fs::write(dir.path().join("mode"), "").unwrap();
+    runtime
+        .prepare_apply(Some(&requested()), |_| Ok(()))
+        .await
+        .unwrap();
+    assert_eq!(&actions(&dir)[3..], ["status", "probe"]);
+}
+
+#[tokio::test]
+async fn metadata_clean_unreadable_ownership_is_not_legacy_recovery() {
+    let (dir, runtime) = metadata_profile_fake();
+    runtime.status().await;
+    fs::write(dir.path().join("mode"), "metadata_clean_owned").unwrap();
+    let info = runtime.recovery_status().await.unwrap();
+    assert!(!info.available && info.managed && info.ownership_unavailable);
+    assert!(!reports_recovery(&info));
+    assert!(!runtime.guard.recovery_outstanding.load(Ordering::SeqCst));
+    assert_eq!(actions(&dir), ["status", "metadata"]);
+}
+
+#[tokio::test]
+async fn pending_or_recovery_guards_never_select_metadata_and_unreaped_never_spawns() {
+    for condition in 0..3 {
+        let (dir, runtime) = metadata_profile_fake();
+        runtime.status().await;
+        if condition == 0 {
+            *runtime.pending.lock().await = Some(RuntimeTransaction {
+                device: runtime.device.clone(),
+                kind: TransactionKind::Noop,
+            });
+        } else if condition == 1 {
+            runtime
+                .guard
+                .recovery_outstanding
+                .store(true, Ordering::SeqCst);
+        } else {
+            runtime.guard.unreaped.store(true, Ordering::SeqCst);
+        }
+        let result = runtime.recovery_status().await;
+        if condition == 2 {
+            assert!(result.is_err());
+            assert_eq!(actions(&dir), ["status"]);
+            assert!(runtime.guard.unreaped.load(Ordering::SeqCst));
+        } else {
+            assert!(result.is_ok());
+            assert_eq!(actions(&dir), ["status", "status"]);
+        }
+    }
+}
+
+#[tokio::test]
+async fn metadata_detected_unknown_checkpoint_compensates_before_rollback_and_refreshes_full() {
+    let (dir, runtime) = metadata_profile_fake();
+    let restarted = runtime.restarted();
+    restarted.status().await;
+    let staged = runtime.stage(Some(&requested())).await.unwrap();
+    fs::write(dir.path().join("calls"), "").unwrap();
+    let prepared = restarted
+        .prepare_apply(None, |unknown| {
+            assert!(unknown);
+            assert_eq!(actions(&dir), ["metadata"]);
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert!(prepared.modern_ticket.is_some());
+    assert_eq!(actions(&dir), ["metadata", "rollback", "status", "probe"]);
+    assert!(!restarted.guard.recovery_outstanding.load(Ordering::SeqCst));
+    assert_eq!(
+        restarted
+            .transaction_status(&staged)
+            .await
+            .unwrap()
+            .transaction_status
+            .as_deref(),
+        Some("rolled_back")
+    );
+}
