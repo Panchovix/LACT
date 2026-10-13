@@ -445,7 +445,6 @@ impl<'a> Handler {
             reset,
         } = change;
         let controller = self.controller_by_id(&id).await?;
-        controller.note_previous_config(previous_config.as_ref().unwrap_or(&GpuConfig::default()));
 
         let result = async {
             if reset.is_some() {
@@ -1520,7 +1519,7 @@ pub(crate) struct SnapshotDeviceInfo {
 }
 
 /// A partial Apply keeps the applied part under the normal confirmation; only
-/// settings that were already pending still wait, so it is not rolled back.
+/// deferred rail intent still waits, so it is not rolled back.
 fn accept_partial_apply(error: anyhow::Error) -> anyhow::Result<()> {
     if super::gpu_controller::is_partially_applied(&error) {
         warn!("settings were partially applied: {error:#}");
@@ -1545,7 +1544,7 @@ async fn apply_config_to_controllers(
             // controls, without resetting its unrelated GPU settings.
             controller.restore_runtime_controls().await
         };
-        if let Err(err) = result {
+        if let Err(err) = result.or_else(accept_partial_apply) {
             error!("could not reconcile config for gpu {id}: {err:#}");
             failures.push(format!("{id}: {err:#}"));
         }
@@ -2555,9 +2554,6 @@ mod runtime_config_reconciliation_tests {
         fn friendly_name(&self) -> Option<String> {
             None
         }
-        fn note_previous_config(&self, previous: &GpuConfig) {
-            self.0.note_previous_config(previous);
-        }
         fn apply_config<'a>(
             &'a self,
             config: &'a GpuConfig,
@@ -2588,12 +2584,9 @@ mod runtime_config_reconciliation_tests {
         }
     }
 
-    /// New rail or clock settings in the first edit of a GPU without saved
-    /// settings cannot take effect during an outage, so they are rejected
-    /// instead of becoming the reference for later edits.
     #[cfg(feature = "nvidia")]
     #[tokio::test]
-    async fn first_edit_of_an_unconfigured_gpu_rejects_new_voltage_settings_during_an_outage() {
+    async fn first_clock_and_rail_edit_during_outage_is_confirmed_and_reverted_normally() {
         tokio::task::LocalSet::new()
             .run_until(async {
                 let mut config = Config::default();
@@ -2604,42 +2597,53 @@ mod runtime_config_reconciliation_tests {
                     config,
                     BTreeMap::from([("gpu".into(), Box::new(controller) as DynGpuController)]),
                 );
-                for clocks in [false, true] {
-                    let mut rejected = gpu_config(230.0);
-                    if clocks {
-                        rejected
-                            .clocks_configuration
-                            .mem_clock_offsets
-                            .insert(0, 100);
-                    } else {
-                        rejected.nvidia_rail_controls = Some(lact_schema::NvidiaRailControls {
-                            nvvdd: lact_schema::NvidiaRailSettings {
-                                max_voltage_uv: Some(1_125_000),
-                                ..Default::default()
-                            },
-                            ..Default::default()
-                        });
-                    }
-                    assert!(handler.set_gpu_config("gpu", rejected).await.is_err());
-                    assert!(handler.get_gpu_config("gpu").await.unwrap().is_none());
-                }
-                // The defaults are still the reference, so a power edit is kept.
+                let mut desired = gpu_config(230.0);
+                desired
+                    .clocks_configuration
+                    .gpu_clock_offsets
+                    .insert(0, 100);
+                desired
+                    .clocks_configuration
+                    .mem_clock_offsets
+                    .insert(0, 200);
+                desired.nvidia_rail_controls = Some(lact_schema::NvidiaRailControls {
+                    nvvdd: lact_schema::NvidiaRailSettings {
+                        max_voltage_uv: Some(1_125_000),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                });
                 assert_eq!(
                     handler
-                        .set_gpu_config("gpu", gpu_config(230.0))
+                        .set_gpu_config("gpu", desired.clone())
                         .await
                         .unwrap(),
                     120
                 );
                 assert_eq!(
-                    handler
-                        .get_gpu_config("gpu")
-                        .await
-                        .unwrap()
-                        .unwrap()
-                        .power_cap,
-                    Some(230.0)
+                    handler.get_gpu_config("gpu").await.unwrap(),
+                    Some(desired.clone())
                 );
+                assert!(
+                    handler
+                        .set_gpu_config("gpu", gpu_config(200.0))
+                        .await
+                        .is_err()
+                );
+                handler
+                    .confirm_pending_config(ConfirmCommand::Revert)
+                    .unwrap();
+                drop(handler.config_operation.clone().lock_owned().await);
+                assert!(handler.get_gpu_config("gpu").await.unwrap().is_none());
+                handler
+                    .set_gpu_config("gpu", desired.clone())
+                    .await
+                    .unwrap();
+                handler
+                    .confirm_pending_config(ConfirmCommand::Confirm)
+                    .unwrap();
+                drop(handler.config_operation.clone().lock_owned().await);
+                assert_eq!(handler.get_gpu_config("gpu").await.unwrap(), Some(desired));
             })
             .await;
     }

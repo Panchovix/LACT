@@ -69,7 +69,7 @@ pub enum OcPageMsg {
     NvidiaRailControls(Option<lact_schema::NvidiaRailControls>),
     NvidiaRuntimeInfo {
         is_nvidia: bool,
-        info: Option<lact_schema::NvidiaRuntimeInfo>,
+        info: Option<Box<lact_schema::NvidiaRuntimeInfo>>,
     },
     PowerStates {
         pstates: PowerStates,
@@ -253,7 +253,7 @@ impl relm4::Component for OcPage {
                     self.device_info = Some(info.clone());
                     self.nvidia_rails_frame.emit(NvidiaRailsFrameMsg::Info {
                         is_nvidia: info.driver.split_ascii_whitespace().next() == Some("nvidia"),
-                        info: info.nvidia_runtime.clone(),
+                        info: info.nvidia_runtime.clone().map(Box::new),
                     });
                     self.stats_section
                         .emit(GpuStatsSectionMsg::Info(info.clone()));

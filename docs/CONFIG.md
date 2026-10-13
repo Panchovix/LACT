@@ -399,8 +399,8 @@ policies, so a later rail or clock failure cannot leave them unapplied. Clock
 changes still perform the necessary clock reset, then prepare voltage boost and
 rail policies before applying the new clock settings. Startup, controller reload
 and explicit resets invalidate the relevant cached state. Only a fully
-successful Apply becomes the new baseline, so a partial failure cannot turn
-restoration of the previous configuration into a skipped operation. Releasing
+successful group updates its cached baseline, so a failed or deferred group
+cannot turn restoration of the previous configuration into a skipped operation. Releasing
 rail controls still checks the provider's durable ownership even when the local
 configuration is unchanged. Voltage boost and target-temperature failures are
 logged as warnings instead of failing the Apply, and the next Apply retries them.
@@ -408,31 +408,44 @@ This includes restoring the default target temperature after removing a
 configured one: the target read at startup, or just before LACT first changed
 it if it was unreadable then.
 
-If the provider cannot run, Apply still sets the power cap, PowerMizer mode,
-fans and target temperature, and keeps voltage boost, rail and clock settings
-pending. This covers a missing or unusable executable or Python environment, a
-failed start, invalid output, and a timeout after which the provider process was
-confirmed to have exited. Startup, configuration reloads and profile switches
-report an error but keep those independent settings applied. An Apply from the
-GUI that changes only independent settings keeps them under the normal
-confirmation and revert while earlier voltage settings keep waiting; one that
-changes voltage boost, rails or clocks is rejected, and the previous settings
-are applied the same way. For a GPU without saved settings, the defaults are the
-previous settings. Once the provider works again, Apply again or restart the
-daemon to apply the pending settings.
+Unsupported or unreadable rail controls defer only the complete rail bundle of
+that GPU. Clock and VRAM settings, voltage boost, power cap, PowerMizer, fans and
+target temperature can still be applied, including new edits and saved profiles
+on a driver family without writable rail controls. The full desired rail settings
+remain saved and visibly pending; no compatible subset is written when another
+requested field or required restoration is unavailable. Successful groups update
+their cache, and only Rails (plus any independently warned group) is retried.
+An Apply with deferred rails uses the normal confirmation and revert flow.
 
-Every setting stays blocked instead, until a provider reply shows no pending
-recovery, when the provider reported pending recovery, when this daemon has an
-unfinished change, when a provider call that could have written ended without a
-valid reply (even if the request that started it was cancelled), when the
-provider refused a request with its own error (for example because another
-provider process holds the GPU's lock), or while a killed provider process is
-not confirmed to have exited, even if the executable is missing by then. GPU
-reloads keep this state; a daemon restart starts from the provider's next reply.
-A new power limit can change policy state that an unfinished native provider
-transaction verifies, which may then require manual recovery. Power cap,
-PowerMizer, fan and target-temperature settings are each attempted even if
-another one of them fails.
+Providers advertising `capabilities.rail_probe: 1` support a GET-only `probe`
+request containing the full settings bundle. A fresh probe returns `can_stage`,
+`deferred_fields` (rail, field, set/restore operation and reason), and
+`ownership_unavailable`. Stage probes again before creating a checkpoint or
+writing controls. If compatibility changed, its correlated `unavailable` reply
+contains no transaction token and confirms that the bundle was skipped. Previously
+owned fields remain intact, including when a requested release cannot currently
+be verified. Pending intent and its reason are displayed separately from current
+voltage/current readings. Refreshing readings preserves edits and never retries
+rail writes. Once support returns, Apply retries the saved intent without
+re-estimating concrete values for requests already owned by the provider.
+
+A clean missing or unusable provider also defers only Rails. Older providers are
+preflighted through a fresh status and the writable flags of every requested
+policy. If one is absent, LACT skips the whole bundle without Stage. Older
+providers cannot distinguish unavailable committed ownership from recovery, so
+an unavailable managed status remains fail-closed until that ambiguity is resolved.
+An optional provider that is not configured does not block unrelated settings.
+
+Every setting still waits for genuine recovery: an unfinished profile checkpoint,
+reported native recovery, an unconfirmed call that could have written, an unknown
+checkpoint requiring explicit release, a provider refusal other than a typed
+read-only unsupported result, or a killed process not confirmed to have exited.
+These guards survive GPU reloads; a daemon restart uses the provider's next reply.
+Ordinary unsupported rails with clean committed ownership are not recovery when
+the new probe contract establishes that distinction. Reset and cleanup respect
+the same distinction and retain unconfirmed ownership/recovery records. A new
+power limit can change policy state that a genuinely unfinished native transaction
+verifies, so it must not bypass those guards.
 
 Cleaning up an NVIDIA GPU's controller on shutdown, a profile switch, a GPU
 reload or a detach tries to return each of its fans to automatic control and

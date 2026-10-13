@@ -401,3 +401,5 @@ nvidia-rails-sensed = Sensed voltage (driver): { $value } mV
 nvidia-rails-adc = ADC voltage: { $value } mV
 nvidia-rails-current = Rail current reading: { $value } A
 nvidia-rails-arbitrated-ocp = Effective OCP limit: { $value } A
+
+nvidia-rails-pending = Saved rail requests remain pending; the rail bundle was not applied. Clocks, VRAM, power and fan settings can still be applied. Last deferred reason: { $reason }
