@@ -18,7 +18,9 @@ build-release-headless:
 .PHONY: install-resources
 install-resources:
 	install -Dm644 res/lactd.service $(DESTDIR)$(PREFIX)/lib/systemd/system/lactd.service
+	sed -i 's|^ExecStart=lact |ExecStart=$(PREFIX)/bin/lact |' $(DESTDIR)$(PREFIX)/lib/systemd/system/lactd.service
 	install -Dm644 res/io.github.ilya_zlobintsev.LACT.desktop $(DESTDIR)$(PREFIX)/share/applications/io.github.ilya_zlobintsev.LACT.desktop
+	sed -i 's|^Exec=lact |Exec=$(PREFIX)/bin/lact |' $(DESTDIR)$(PREFIX)/share/applications/io.github.ilya_zlobintsev.LACT.desktop
 	install -Dm644 res/io.github.ilya_zlobintsev.LACT.png $(DESTDIR)$(PREFIX)/share/icons/hicolor/512x512/apps/io.github.ilya_zlobintsev.LACT.png
 	install -Dm644 res/io.github.ilya_zlobintsev.LACT.svg $(DESTDIR)$(PREFIX)/share/icons/hicolor/scalable/apps/io.github.ilya_zlobintsev.LACT.svg
 	install -Dm644 res/io.github.ilya_zlobintsev.LACT.metainfo.xml $(DESTDIR)$(PREFIX)/share/metainfo/io.github.ilya_zlobintsev.LACT.metainfo.xml
@@ -26,11 +28,11 @@ install-resources:
 
 .PHONY: install
 install: install-resources
-	install -Dm755 target/release/lact $(DESTDIR)$(PREFIX)/bin/lact
+	install -Dm755 $(CARGO_TARGET_DIR)/release/lact $(DESTDIR)$(PREFIX)/bin/lact
 
 .PHONY: install-debug
 install-debug: install-resources
-	install -Dm755 target/debug/lact $(DESTDIR)$(PREFIX)/bin/lact
+	install -Dm755 $(CARGO_TARGET_DIR)/debug/lact $(DESTDIR)$(PREFIX)/bin/lact
 
 .PHONY: uninstall
 uninstall:
