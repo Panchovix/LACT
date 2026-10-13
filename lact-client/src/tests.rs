@@ -197,3 +197,167 @@ fn cancelled_poll_reconnects_before_loading_saved_rail_settings() {
             .expect("synthetic reconnection timed out");
         });
 }
+
+async fn verify_optional_api_does_not_block_requests<S>(
+    client: &DaemonClient,
+    optional: &DaemonClient,
+    mut main_server: BufReader<S>,
+    mut optional_server: BufReader<S>,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    assert!(!Rc::ptr_eq(&client.stream, &optional.stream));
+    let mut line = String::new();
+    let pending = match select(
+        Box::pin(optional.get_device_api_info("synthetic")),
+        Box::pin(optional_server.read_line(&mut line)),
+    )
+    .await
+    {
+        Either::Right((result, pending)) => {
+            result.unwrap();
+            pending
+        }
+        Either::Left(_) => panic!("optional API request completed before its reply"),
+    };
+    assert!(line.contains("device_api_info"));
+    // The optional response is deliberately withheld until both foreground
+    // requests finish. The confirmation endpoint here is only a fake peer.
+    let foreground = async {
+        client.ping().await.unwrap();
+        client
+            .confirm_pending_config(ConfirmCommand::Confirm)
+            .await
+            .unwrap();
+    };
+    let replies = async {
+        for (command, reply) in [
+            ("ping", serde_json::to_string(&Response::Ok(Pong)).unwrap()),
+            (
+                "confirm_pending_config",
+                serde_json::to_string(&Response::Ok(())).unwrap(),
+            ),
+        ] {
+            let mut line = String::new();
+            main_server.read_line(&mut line).await.unwrap();
+            assert!(line.contains(command));
+            main_server
+                .write_all(format!("{reply}\n").as_bytes())
+                .await
+                .unwrap();
+        }
+    };
+    futures::join!(foreground, replies);
+    let reply = serde_json::to_string(&Response::Ok(DeviceApiInfo::default())).unwrap();
+    optional_server
+        .write_all(format!("{reply}\n").as_bytes())
+        .await
+        .unwrap();
+    pending.await.unwrap();
+}
+
+#[test]
+fn independent_tcp_api_stream_preserves_endpoint_and_allows_ping_and_confirm() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let client = DaemonClient::connect_tcp(listener.local_addr().unwrap())
+                    .await
+                    .unwrap();
+                let (main, _) = listener.accept().await.unwrap();
+                let optional = client.independent_connection().await.unwrap();
+                let (independent, _) = listener.accept().await.unwrap();
+                verify_optional_api_does_not_block_requests(
+                    &client,
+                    &optional,
+                    BufReader::new(main),
+                    BufReader::new(independent),
+                )
+                .await;
+            })
+            .await
+            .expect("independent TCP API stream blocked foreground requests");
+        });
+}
+
+#[test]
+fn independent_unix_api_stream_preserves_endpoint_and_allows_ping_and_confirm() {
+    struct SocketPath(PathBuf);
+    impl Drop for SocketPath {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = SocketPath(
+        std::env::temp_dir().join(format!("lact-api-{}-{unique}.sock", std::process::id())),
+    );
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let listener = tokio::net::UnixListener::bind(&path.0).unwrap();
+                let connection = UnixConnection::connect(&path.0).await.unwrap();
+                let client = DaemonClient {
+                    stream: Rc::new(Mutex::new(connection as Box<dyn DaemonConnection>)),
+                    status_tx: broadcast::Sender::new(STATUS_MSG_CHANNEL_SIZE),
+                    reconnect: true,
+                    embedded: false,
+                };
+                let (main, _) = listener.accept().await.unwrap();
+                let optional = client.independent_connection().await.unwrap();
+                let (independent, _) = listener.accept().await.unwrap();
+                verify_optional_api_does_not_block_requests(
+                    &client,
+                    &optional,
+                    BufReader::new(main),
+                    BufReader::new(independent),
+                )
+                .await;
+            })
+            .await
+            .expect("independent Unix API stream blocked foreground requests");
+        });
+}
+
+#[test]
+fn unnamed_and_embedded_connections_keep_their_original_stream() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let (mut client, _server) = pair();
+            let optional = client.independent_connection().await.unwrap();
+            assert!(Rc::ptr_eq(&client.stream, &optional.stream));
+            client.embedded = true;
+            let optional = client.independent_connection().await.unwrap();
+            assert!(Rc::ptr_eq(&client.stream, &optional.stream));
+        });
+}
+
+#[test]
+fn unavailable_named_endpoint_does_not_fall_back_to_the_existing_stream() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = DaemonClient::connect_tcp(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (_server, _) = listener.accept().await.unwrap();
+            drop(listener);
+            assert!(client.independent_connection().await.is_err());
+        });
+}
