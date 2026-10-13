@@ -40,7 +40,7 @@ use nvml_wrapper::{
     enums::device::{GpuLockedClocksSetting, PowerMizerMode, UsedGpuMemory},
     error::NvmlError,
 };
-use runtime_controls::RuntimeControls;
+use runtime_controls::{RailDeferral, RailPreparation, RuntimeControls};
 use std::{
     cell::{Cell, RefCell},
     cmp,
@@ -107,6 +107,7 @@ pub struct NvidiaGpuController {
     xbar_ratio_written: Cell<bool>,
     runtime_controls: Option<RuntimeControls>,
     applied_state: RefCell<apply_plan::AppliedState>,
+    deferred_rails: RefCell<Option<RailDeferral>>,
     frequency_recovery_needed: Cell<bool>,
     frequency_recovery_discovery_needed: Cell<bool>,
 }
@@ -207,6 +208,7 @@ impl NvidiaGpuController {
             xbar_ratio_written: Cell::new(false),
             runtime_controls,
             applied_state: RefCell::new(apply_plan::AppliedState::default()),
+            deferred_rails: RefCell::new(None),
             frequency_recovery_needed: Cell::new(false),
             frequency_recovery_discovery_needed: Cell::new(false),
         })
@@ -1483,10 +1485,14 @@ impl NvidiaGpuController {
         Ok(())
     }
 
-    /// The helper must be usable and its recovery resolved before any profile group.
-    async fn prepare_runtime_controls(&self, config: &GpuConfig) -> anyhow::Result<()> {
+    /// Resolve real recovery first. Ordinary rail unavailability defers only
+    /// Rails and never prevents applying clocks, VRAM or the other groups.
+    async fn prepare_runtime_controls(
+        &self,
+        config: &GpuConfig,
+    ) -> anyhow::Result<RailPreparation> {
         let settings = config.nvidia_rail_controls.as_ref();
-        match &self.runtime_controls {
+        let result = match &self.runtime_controls {
             Some(runtime) => {
                 runtime
                     .prepare_apply(settings, |unknown| self.recover_frequencies(unknown))
@@ -1495,28 +1501,22 @@ impl NvidiaGpuController {
             None if settings.is_some() => Err(runtime_controls::unavailable(anyhow!(
                 "NVIDIA runtime helper is not configured"
             ))),
-            None => self.complete_frequency_recovery(),
+            None => {
+                self.complete_frequency_recovery()?;
+                return Ok(RailPreparation::Ready);
+            }
+        };
+        match result {
+            Ok(decision) => Ok(decision),
+            Err(error) if runtime_controls::is_unavailable(&error) => {
+                self.complete_frequency_recovery()?;
+                Ok(RailPreparation::Deferred(RailDeferral::unavailable(
+                    settings,
+                    format!("{error:#}"),
+                )))
+            }
+            Err(error) => Err(error),
         }
-    }
-
-    /// Without a usable helper the rail state is unknown, so only power, fan and
-    /// thermal settings are applied; boost, rails and clocks stay pending for an
-    /// Apply after the helper responds. A new power limit can change the policy
-    /// CONTROL that an unfinished native helper transaction verifies, which may
-    /// then require manual recovery.
-    async fn apply_without_runtime_helper(
-        &self,
-        config: &GpuConfig,
-        unavailable: anyhow::Error,
-    ) -> anyhow::Result<()> {
-        self.complete_frequency_recovery()?;
-        let degraded = self.applied_state.borrow_mut().begin_without_helper(config);
-        // Without complete(), every attempted group also stays pending.
-        let mut deferred = Vec::new();
-        self.apply_independent_groups(config, degraded.groups, &mut deferred)
-            .await
-            .with_context(|| format!("{unavailable:#}"))?;
-        Err(degraded_outcome(degraded.new_voltage_request, unavailable))
     }
 
     /// Writes every independent group even when an earlier one fails, so a
@@ -1576,38 +1576,20 @@ impl NvidiaGpuController {
     }
 }
 
-/// The result of an Apply without a usable helper once its independent groups
-/// are written. New voltage or clock requests cannot take effect, so the change
-/// as a whole failed; otherwise only earlier pending settings are still waiting.
-fn degraded_outcome(new_voltage_request: bool, unavailable: anyhow::Error) -> anyhow::Error {
-    let error = unavailable.context(
-        "Applied power, fan and thermal settings; voltage boost, rail and clock settings stay pending",
-    );
-    if new_voltage_request {
-        error
-    } else {
-        super::partially_applied(error)
-    }
-}
-
-/// The Apply results of an NVIDIA controller whose runtime helper cannot run,
-/// for testing callers without NVML. Its independent groups always succeed.
+/// The shared planner's successful non-rail completion under a synthetic outage.
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct HelperOutage(RefCell<apply_plan::AppliedState>);
 
 #[cfg(test)]
 impl HelperOutage {
-    pub(crate) fn note_previous_config(&self, previous: &GpuConfig) {
-        self.0.borrow_mut().note_previous(previous);
-    }
-
     pub(crate) fn apply_config(&self, config: &GpuConfig) -> anyhow::Error {
-        let degraded = self.0.borrow_mut().begin_without_helper(config);
-        degraded_outcome(
-            degraded.new_voltage_request,
-            runtime_controls::unavailable(anyhow!("synthetic helper outage")),
-        )
+        self.0
+            .borrow_mut()
+            .complete_with_deferred(config, &[apply_plan::Group::Rails]);
+        super::partially_applied(anyhow!(
+            "Rail settings remain pending during a synthetic helper outage"
+        ))
     }
 }
 
@@ -1649,7 +1631,14 @@ impl GpuController for NvidiaGpuController {
 
             DeviceInfo {
                 nvidia_runtime: match &self.runtime_controls {
-                    Some(runtime) => Some(runtime.status().await),
+                    Some(runtime) => {
+                        let mut info = runtime.status().await;
+                        if let Some(reason) = self.deferred_rails.borrow().as_ref() {
+                            reason.annotate(&mut info);
+                        }
+                        info.rails_pending |= self.applied_state.borrow().rails_pending();
+                        Some(info)
+                    }
                     None => None,
                 },
                 pci_info: Some(self.common.pci_info.clone()),
@@ -2092,11 +2081,13 @@ impl GpuController for NvidiaGpuController {
     fn apply_config<'a>(&'a self, config: &'a GpuConfig) -> LocalBoxFuture<'a, anyhow::Result<()>> {
         Box::pin(async {
             runtime_controls::validate_settings(config.nvidia_rail_controls.as_ref())?;
-            if let Err(error) = self.prepare_runtime_controls(config).await {
-                if runtime_controls::is_unavailable(&error) {
-                    return self.apply_without_runtime_helper(config, error).await;
-                }
-                return Err(error);
+            let preparation = self.prepare_runtime_controls(config).await?;
+            let mut rail_deferral = match preparation {
+                RailPreparation::Ready => None,
+                RailPreparation::Deferred(reason) => Some(reason),
+            };
+            if rail_deferral.is_some() {
+                self.deferred_rails.replace(rail_deferral.clone());
             }
             let plan = self.applied_state.borrow().plan(config);
             let mut transaction = None;
@@ -2114,6 +2105,10 @@ impl GpuController for NvidiaGpuController {
                             self.reset_clock_settings(false)?;
                         }
                         apply_plan::Step::Apply(group) => {
+                            if group == apply_plan::Group::Rails && rail_deferral.is_some() {
+                                deferred.push(group);
+                                continue;
+                            }
                             self.applied_state.borrow_mut().attempted(group);
                             match group {
                                 apply_plan::Group::Boost => {
@@ -2124,11 +2119,15 @@ impl GpuController for NvidiaGpuController {
                                 }
                                 apply_plan::Group::Rails => {
                                     if let Some(runtime) = &self.runtime_controls {
-                                        transaction = Some(
-                                            runtime
-                                                .stage(config.nvidia_rail_controls.as_ref())
-                                                .await?,
-                                        );
+                                        let staged = runtime
+                                            .stage(config.nvidia_rail_controls.as_ref())
+                                            .await?;
+                                        if let Some(reason) = staged.deferral() {
+                                            rail_deferral = Some(reason.clone());
+                                            self.deferred_rails.replace(rail_deferral.clone());
+                                            deferred.push(group);
+                                        }
+                                        transaction = Some(staged);
                                     }
                                 }
                                 apply_plan::Group::Clocks => {
@@ -2148,8 +2147,19 @@ impl GpuController for NvidiaGpuController {
                         }
                     }
                 }
-                if let (Some(runtime), Some(transaction)) = (&self.runtime_controls, &transaction) {
-                    runtime.commit(transaction).await?;
+                if let (Some(runtime), Some(transaction)) = (&self.runtime_controls, &transaction)
+                    && let Err(error) = runtime.commit(transaction).await
+                {
+                    if !transaction.is_staged() && runtime_controls::is_unavailable(&error) {
+                        rail_deferral = Some(runtime_controls::deferred_reason(
+                            &error,
+                            config.nvidia_rail_controls.as_ref(),
+                        ));
+                        self.deferred_rails.replace(rail_deferral.clone());
+                        deferred.push(apply_plan::Group::Rails);
+                    } else {
+                        return Err(error);
+                    }
                 }
                 Ok(())
             }
@@ -2174,16 +2184,16 @@ impl GpuController for NvidiaGpuController {
             self.frequency_recovery_needed.set(false);
             self.frequency_recovery_discovery_needed.set(false);
             let mut applied = self.applied_state.borrow_mut();
-            applied.complete(config);
-            for group in deferred {
-                applied.invalidate(group);
+            applied.complete_with_deferred(config, &deferred);
+            if let Some(reason) = rail_deferral {
+                return Err(super::partially_applied(anyhow!(
+                    "Rail settings are pending; other settings applied: {}",
+                    reason.reason
+                )));
             }
+            self.deferred_rails.take();
             Ok(())
         })
-    }
-
-    fn note_previous_config(&self, previous: &GpuConfig) {
-        self.applied_state.borrow_mut().note_previous(previous);
     }
 
     fn restore_runtime_controls(&self) -> LocalBoxFuture<'_, anyhow::Result<()>> {
@@ -2191,17 +2201,62 @@ impl GpuController for NvidiaGpuController {
             self.applied_state
                 .borrow_mut()
                 .invalidate(apply_plan::Group::Rails);
-            self.recover_runtime_controls(true).await?;
-            if let Some(runtime) = &self.runtime_controls {
-                runtime.apply(None).await?;
+            match self.prepare_runtime_controls(&GpuConfig::default()).await? {
+                RailPreparation::Deferred(reason) => {
+                    self.deferred_rails.replace(Some(reason.clone()));
+                    return Err(super::partially_applied(anyhow!(
+                        "Rail restoration is pending: {}",
+                        reason.reason
+                    )));
+                }
+                RailPreparation::Ready => (),
             }
+            if let Some(runtime) = &self.runtime_controls {
+                let transaction = runtime.stage(None).await?;
+                if let Some(reason) = transaction.deferral() {
+                    self.deferred_rails.replace(Some(reason.clone()));
+                    return Err(super::partially_applied(anyhow!(
+                        "Rail restoration is pending: {}",
+                        reason.reason
+                    )));
+                }
+                if let Err(error) = runtime.commit(&transaction).await {
+                    if !transaction.is_staged() && runtime_controls::is_unavailable(&error) {
+                        let reason = runtime_controls::deferred_reason(&error, None);
+                        self.deferred_rails.replace(Some(reason.clone()));
+                        return Err(super::partially_applied(anyhow!(
+                            "Rail restoration is pending: {}",
+                            reason.reason
+                        )));
+                    }
+                    if let Err(recovery) = runtime.rollback(&transaction).await {
+                        return Err(error.context(format!(
+                            "NVIDIA rail restoration rollback unconfirmed: {recovery:#}"
+                        )));
+                    }
+                    return Err(error);
+                }
+            }
+            self.deferred_rails.take();
+            self.applied_state.borrow_mut().rails_released();
             Ok(())
         }
         .boxed_local()
     }
 
     fn prepare_reset(&self) -> LocalBoxFuture<'_, anyhow::Result<()>> {
-        async { self.recover_runtime_controls(false).await }.boxed_local()
+        async {
+            match self.recover_runtime_controls(false).await {
+                Err(error) if runtime_controls::is_unavailable(&error) => {
+                    self.complete_frequency_recovery()?;
+                    self.deferred_rails
+                        .replace(Some(RailDeferral::unavailable(None, format!("{error:#}"))));
+                    Ok(())
+                }
+                result => result,
+            }
+        }
+        .boxed_local()
     }
 
     fn release_fan_control(&self) -> LocalBoxFuture<'_, anyhow::Result<()>> {
@@ -2227,7 +2282,11 @@ impl GpuController for NvidiaGpuController {
             self.applied_state.borrow_mut().invalidate_all();
             // A failed restore keeps the unresolved helper state as it is.
             if let Err(err) = self.restore_runtime_controls().await {
-                error!("could not restore NVIDIA runtime controls during cleanup: {err:#}");
+                if super::is_partially_applied(&err) {
+                    warn!("rail restoration is deferred during cleanup: {err:#}");
+                } else {
+                    error!("could not restore NVIDIA runtime controls during cleanup: {err:#}");
+                }
             }
             // A dropped or detached controller must not leave its fans at the
             // last manual duty with nothing driving them.

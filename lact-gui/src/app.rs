@@ -664,7 +664,7 @@ impl AppModel {
                 // Refresh readings only; retain pending edits and the selected profile.
                 self.oc_page.emit(OcPageMsg::NvidiaRuntimeInfo {
                     is_nvidia: info.driver.split_ascii_whitespace().next() == Some("nvidia"),
-                    info: info.nvidia_runtime,
+                    info: info.nvidia_runtime.map(Box::new),
                 });
             }
             AppMsg::ReloadApiInfo => {

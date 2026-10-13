@@ -1,10 +1,13 @@
 //! Versioned JSON IPC only; native controls and persistent baselines live in the helper.
 use crate::config::NvidiaRuntimeHelperConfig;
 use anyhow::{Context, anyhow, bail, ensure};
-use lact_schema::{NvidiaRailControls, NvidiaRuntimeDevice, NvidiaRuntimeInfo};
+use lact_schema::{
+    NvidiaDeferredRailField, NvidiaRail, NvidiaRailControls, NvidiaRailField, NvidiaRailOperation,
+    NvidiaRuntimeDevice, NvidiaRuntimeInfo,
+};
 use serde::Serialize;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     io::Read,
     os::unix::{fs::MetadataExt, process::CommandExt},
@@ -74,10 +77,254 @@ fn recovery_reported(error: anyhow::Error) -> anyhow::Error {
     RecoveryReported(error).into()
 }
 
-/// Whether only the independent setting groups may still be applied.
+/// Whether only Rails must be deferred, without blocking any other group.
 pub(super) fn is_unavailable(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| cause.is::<HelperUnavailable>())
+    error
+        .chain()
+        .any(|cause| cause.is::<HelperUnavailable>() || cause.is::<RailDeferral>())
         && !error.chain().any(|cause| cause.is::<RecoveryReported>())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RailDeferral {
+    pub(super) fields: Vec<NvidiaDeferredRailField>,
+    pub(super) reason: String,
+    pub(super) ownership_unavailable: bool,
+}
+
+impl std::fmt::Display for RailDeferral {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.reason)
+    }
+}
+impl std::error::Error for RailDeferral {}
+
+pub(super) fn deferred_reason(
+    error: &anyhow::Error,
+    settings: Option<&NvidiaRailControls>,
+) -> RailDeferral {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<RailDeferral>().cloned())
+        .unwrap_or_else(|| RailDeferral::unavailable(settings, format!("{error:#}")))
+}
+
+impl RailDeferral {
+    pub(super) fn unavailable(settings: Option<&NvidiaRailControls>, reason: String) -> Self {
+        let fields = requested_fields(settings)
+            .into_iter()
+            .map(|(rail, field)| NvidiaDeferredRailField {
+                rail,
+                field,
+                operation: NvidiaRailOperation::Set,
+                reason: reason.clone(),
+            })
+            .collect();
+        Self {
+            fields,
+            reason,
+            ownership_unavailable: false,
+        }
+    }
+
+    fn from_info(info: &NvidiaRuntimeInfo) -> Self {
+        Self {
+            fields: info.deferred_fields.clone(),
+            reason: info
+                .reason
+                .clone()
+                .or_else(|| {
+                    info.deferred_fields
+                        .first()
+                        .map(|field| field.reason.clone())
+                })
+                .unwrap_or_else(|| "Rail settings cannot currently be set or restored".into()),
+            ownership_unavailable: info.ownership_unavailable,
+        }
+    }
+
+    pub(super) fn annotate(&self, info: &mut NvidiaRuntimeInfo) {
+        info.rails_pending = true;
+        info.deferred_fields.clone_from(&self.fields);
+        info.ownership_unavailable |= self.ownership_unavailable;
+        if info.reason.is_none() {
+            info.reason = Some(self.reason.clone());
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum RailPreparation {
+    Ready,
+    Deferred(RailDeferral),
+}
+
+fn requested_fields(settings: Option<&NvidiaRailControls>) -> Vec<(NvidiaRail, NvidiaRailField)> {
+    let mut fields = Vec::new();
+    if let Some(settings) = settings {
+        for (rail, values) in [
+            (NvidiaRail::Nvvdd, &settings.nvvdd),
+            (NvidiaRail::Msvdd, &settings.msvdd),
+        ] {
+            for (field, value) in [
+                (NvidiaRailField::MinVoltageUv, values.min_voltage_uv),
+                (NvidiaRailField::MaxVoltageUv, values.max_voltage_uv),
+                (NvidiaRailField::OvervoltageUv, values.overvoltage_uv),
+                (NvidiaRailField::OcpLimitMa, values.ocp_limit_ma),
+            ] {
+                if value.is_some() {
+                    fields.push((rail, field));
+                }
+            }
+        }
+    }
+    fields
+}
+
+fn field_writable(info: &NvidiaRuntimeInfo, rail: NvidiaRail, field: NvidiaRailField) -> bool {
+    info.available
+        && info
+            .rails
+            .iter()
+            .find(|record| record.rail == rail)
+            .is_some_and(|record| match field {
+                NvidiaRailField::MinVoltageUv => record
+                    .min_voltage
+                    .as_ref()
+                    .is_some_and(|value| value.writable),
+                NvidiaRailField::MaxVoltageUv => record
+                    .max_voltage
+                    .as_ref()
+                    .is_some_and(|value| value.writable),
+                NvidiaRailField::OvervoltageUv => record
+                    .overvoltage
+                    .as_ref()
+                    .is_some_and(|value| value.writable),
+                NvidiaRailField::OcpLimitMa => record
+                    .ocp_limit
+                    .as_ref()
+                    .is_some_and(|value| value.writable),
+            })
+}
+
+fn legacy_preparation(
+    info: &NvidiaRuntimeInfo,
+    settings: Option<&NvidiaRailControls>,
+) -> RailPreparation {
+    let requested = requested_fields(settings);
+    let mut affected: Vec<_> = requested
+        .iter()
+        .map(|(rail, field)| (*rail, *field, NvidiaRailOperation::Set))
+        .collect();
+    for record in &info.rails {
+        for (field, value) in [
+            (
+                NvidiaRailField::MinVoltageUv,
+                record
+                    .min_voltage
+                    .as_ref()
+                    .and_then(|value| value.requested_uv),
+            ),
+            (
+                NvidiaRailField::MaxVoltageUv,
+                record
+                    .max_voltage
+                    .as_ref()
+                    .and_then(|value| value.requested_uv),
+            ),
+            (
+                NvidiaRailField::OvervoltageUv,
+                record
+                    .overvoltage
+                    .as_ref()
+                    .and_then(|value| value.requested_uv),
+            ),
+            (
+                NvidiaRailField::OcpLimitMa,
+                record
+                    .ocp_limit
+                    .as_ref()
+                    .and_then(|value| value.requested_ma),
+            ),
+        ] {
+            if value.is_some() && !requested.contains(&(record.rail, field)) {
+                affected.push((record.rail, field, NvidiaRailOperation::Restore));
+            }
+        }
+    }
+    if affected
+        .iter()
+        .all(|(rail, field, _)| field_writable(info, *rail, *field))
+    {
+        return RailPreparation::Ready;
+    }
+    let reason = info.reason.clone().unwrap_or_else(|| {
+        "Legacy provider does not expose every required rail field as writable".into()
+    });
+    let fields = affected
+        .into_iter()
+        .map(|(rail, field, operation)| {
+            let detail = if field_writable(info, rail, field) {
+                "Another rail field is unavailable; the complete bundle remains pending".into()
+            } else {
+                reason.clone()
+            };
+            NvidiaDeferredRailField {
+                rail,
+                field,
+                operation,
+                reason: detail,
+            }
+        })
+        .collect();
+    RailPreparation::Deferred(RailDeferral {
+        fields,
+        reason,
+        ownership_unavailable: false,
+    })
+}
+
+fn probe_preparation(info: &NvidiaRuntimeInfo) -> anyhow::Result<RailPreparation> {
+    ensure!(
+        info.capabilities.rail_probe == 1,
+        "Unsupported NVIDIA rail probe capability"
+    );
+    ensure!(
+        !reports_recovery(info),
+        "NVIDIA rail probe reported recovery"
+    );
+    ensure!(
+        info.deferred_fields.len() <= 8,
+        "Too many deferred NVIDIA rail fields"
+    );
+    let mut identities = HashSet::new();
+    for field in &info.deferred_fields {
+        ensure!(
+            !field.reason.is_empty()
+                && field.reason.len() <= 2000
+                && identities.insert((field.rail, field.field)),
+            "Invalid deferred NVIDIA rail field"
+        );
+    }
+    match info.can_stage {
+        Some(true) => {
+            ensure!(
+                info.deferred_fields.is_empty() && !info.ownership_unavailable,
+                "NVIDIA probe contradicts its stage permission"
+            );
+            Ok(RailPreparation::Ready)
+        }
+        Some(false) => {
+            ensure!(
+                !info.deferred_fields.is_empty()
+                    || info.ownership_unavailable
+                    || info.reason.is_some(),
+                "NVIDIA probe does not explain its unavailable bundle"
+            );
+            Ok(RailPreparation::Deferred(RailDeferral::from_info(info)))
+        }
+        None => bail!("NVIDIA probe omitted its stage permission"),
+    }
 }
 
 pub(super) struct RuntimeControls {
@@ -120,6 +367,7 @@ fn device_guard(device: &NvidiaRuntimeDevice) -> Arc<DeviceGuard> {
 #[serde(rename_all = "lowercase")]
 enum Action {
     Status,
+    Probe,
     Apply,
     Restore,
     Stage,
@@ -130,7 +378,7 @@ enum Action {
 impl Action {
     /// Whether an unconfirmed call may have changed native helper state.
     fn may_write(self) -> bool {
-        !matches!(self, Self::Status)
+        !matches!(self, Self::Status | Self::Probe)
     }
 }
 
@@ -155,6 +403,7 @@ pub(super) struct RuntimeTransaction {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum TransactionKind {
     Noop,
+    Deferred(RailDeferral),
     LegacyDeferred(Option<NvidiaRailControls>),
     Profile {
         transaction_id: Option<String>,
@@ -163,6 +412,13 @@ enum TransactionKind {
 }
 
 impl RuntimeTransaction {
+    pub(super) fn deferral(&self) -> Option<&RailDeferral> {
+        match &self.kind {
+            TransactionKind::Deferred(reason) => Some(reason),
+            _ => None,
+        }
+    }
+
     pub(super) fn is_staged(&self) -> bool {
         matches!(
             self.kind,
@@ -230,7 +486,13 @@ impl RuntimeControls {
             Ok(info) => info,
             Err(err) => NvidiaRuntimeInfo {
                 protocol_version: PROTOCOL_VERSION,
-                recovery_required: false,
+                recovery_required: self.guard.recovery_outstanding.load(Ordering::SeqCst)
+                    || self.guard.unreaped.load(Ordering::SeqCst)
+                    || self.pending.lock().await.is_some(),
+                can_stage: None,
+                deferred_fields: vec![],
+                ownership_unavailable: false,
+                rails_pending: false,
                 capabilities: Default::default(),
                 transaction_id: None,
                 transaction_status: None,
@@ -252,6 +514,18 @@ impl RuntimeControls {
             Action::Restore
         };
         let info = self.invoke(action, settings).await?;
+        // A provider upgraded between a legacy preflight and commit may now
+        // return an explicit clean skipped bundle instead of applying it.
+        if info.capabilities.rail_probe == 1 && info.can_stage == Some(false) {
+            ensure!(
+                info.transaction_id.is_none() && !reports_recovery(&info),
+                "A deferred legacy Apply did not establish a clean no-write outcome"
+            );
+            let RailPreparation::Deferred(reason) = probe_preparation(&info)? else {
+                bail!("A deferred legacy Apply contradicts its probe permission");
+            };
+            return Err(reason.into());
+        }
         if settings.is_some() {
             ensure!(
                 info.available,
@@ -326,11 +600,12 @@ impl RuntimeControls {
         &self,
         settings: Option<&NvidiaRailControls>,
         recover_frequencies: impl FnOnce(bool) -> anyhow::Result<()>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<RailPreparation> {
         self.guard_own_pending(async {
             self.validate(settings)?;
             self.recover_unguarded(settings.is_none(), recover_frequencies)
-                .await
+                .await?;
+            self.preflight_rails(settings).await
         })
         .await
     }
@@ -422,7 +697,7 @@ impl RuntimeControls {
             self.rollback(&transaction)
                 .await
                 .map_err(recovery_reported)?;
-        } else if info.recovery_required || (!info.available && info.managed) {
+        } else if reports_recovery(&info) {
             ensure!(
                 explicit_restore,
                 "NVIDIA runtime recovery is required before changing GPU settings"
@@ -442,16 +717,85 @@ impl RuntimeControls {
         Ok(())
     }
 
+    async fn preflight_rails(
+        &self,
+        settings: Option<&NvidiaRailControls>,
+    ) -> anyhow::Result<RailPreparation> {
+        let info = self.invoke(Action::Status, None).await?;
+        ensure!(
+            !reports_recovery(&info),
+            "NVIDIA recovery must finish before probing rail settings"
+        );
+        if info.capabilities.rail_probe == 1 {
+            let probe = self.invoke(Action::Probe, settings).await?;
+            probe_preparation(&probe)
+        } else {
+            Ok(legacy_preparation(&info, settings))
+        }
+    }
+
     pub(super) async fn stage(
         &self,
         settings: Option<&NvidiaRailControls>,
     ) -> anyhow::Result<RuntimeTransaction> {
-        self.validate(settings)?;
+        let preflight = self
+            .guard_own_pending(async {
+                self.validate(settings)?;
+                ensure!(
+                    self.pending.lock().await.is_none(),
+                    "A previous NVIDIA profile transaction still needs recovery"
+                );
+                self.preflight_rails(settings).await
+            })
+            .await;
+        let decision = match preflight {
+            Ok(decision) => decision,
+            Err(error) if is_unavailable(&error) => {
+                RailPreparation::Deferred(RailDeferral::unavailable(settings, format!("{error:#}")))
+            }
+            Err(error) => return Err(error),
+        };
+        if let RailPreparation::Deferred(reason) = decision {
+            return Ok(RuntimeTransaction {
+                device: self.device.clone(),
+                kind: TransactionKind::Deferred(reason),
+            });
+        }
+        let info = match self
+            .guard_own_pending(self.invoke(Action::Status, None))
+            .await
+        {
+            Ok(info) => info,
+            Err(error) if is_unavailable(&error) => {
+                return Ok(RuntimeTransaction {
+                    device: self.device.clone(),
+                    kind: TransactionKind::Deferred(deferred_reason(&error, settings)),
+                });
+            }
+            Err(error) => return Err(error),
+        };
         ensure!(
-            self.pending.lock().await.is_none(),
-            "A previous NVIDIA profile transaction still needs recovery"
+            !reports_recovery(&info),
+            "NVIDIA recovery appeared before staging"
         );
-        let info = self.invoke(Action::Status, None).await?;
+        if info.capabilities.rail_probe != 1
+            && let RailPreparation::Deferred(reason) = legacy_preparation(&info, settings)
+        {
+            return Ok(RuntimeTransaction {
+                device: self.device.clone(),
+                kind: TransactionKind::Deferred(reason),
+            });
+        }
+        if info.capabilities.rail_probe != 1
+            && !info.available
+            && !info.managed
+            && requested_fields(settings).is_empty()
+        {
+            return Ok(RuntimeTransaction {
+                device: self.device.clone(),
+                kind: TransactionKind::Noop,
+            });
+        }
         if info.capabilities.profile_transactions != 1 {
             // Preserve older providers: apply them last, as before this extension.
             return Ok(RuntimeTransaction {
@@ -480,6 +824,22 @@ impl RuntimeControls {
                 info.request_id.as_deref() == Some(request_id.as_str()),
                 "NVIDIA stage returned a different request identity"
             );
+            if info.transaction_status.as_deref() == Some("unavailable") {
+                ensure!(
+                    info.capabilities.rail_probe == 1
+                        && info.transaction_id.is_none()
+                        && !reports_recovery(&info),
+                    "NVIDIA unavailable stage did not establish a clean no-write outcome"
+                );
+                let RailPreparation::Deferred(reason) = probe_preparation(&info)? else {
+                    bail!("NVIDIA unavailable stage contradicts its probe permission");
+                };
+                *self.pending.lock().await = None;
+                return Ok(RuntimeTransaction {
+                    device: self.device.clone(),
+                    kind: TransactionKind::Deferred(reason),
+                });
+            }
             if info.transaction_status.as_deref() == Some("noop") {
                 ensure!(
                     settings.is_none_or(|settings| *settings == NvidiaRailControls::default())
@@ -536,14 +896,17 @@ impl RuntimeControls {
             transaction.device == self.device,
             "NVIDIA profile receipt belongs to a different GPU"
         );
-        match &transaction.kind {
-            TransactionKind::Noop => Ok(()),
-            TransactionKind::LegacyDeferred(settings) => self.apply(settings.as_ref()).await,
-            TransactionKind::Profile { .. } => {
-                self.finalize(transaction, Action::Commit, "committed")
-                    .await
+        self.guard_own_pending(async {
+            match &transaction.kind {
+                TransactionKind::Noop | TransactionKind::Deferred(_) => Ok(()),
+                TransactionKind::LegacyDeferred(settings) => self.apply(settings.as_ref()).await,
+                TransactionKind::Profile { .. } => {
+                    self.finalize(transaction, Action::Commit, "committed")
+                        .await
+                }
             }
-        }
+        })
+        .await
     }
 
     pub(super) async fn rollback(&self, transaction: &RuntimeTransaction) -> anyhow::Result<()> {
@@ -552,7 +915,9 @@ impl RuntimeControls {
             "NVIDIA profile receipt belongs to a different GPU"
         );
         match &transaction.kind {
-            TransactionKind::Noop | TransactionKind::LegacyDeferred(_) => Ok(()),
+            TransactionKind::Noop
+            | TransactionKind::Deferred(_)
+            | TransactionKind::LegacyDeferred(_) => Ok(()),
             TransactionKind::Profile { .. } => {
                 self.finalize(transaction, Action::Rollback, "rolled_back")
                     .await
@@ -722,7 +1087,9 @@ fn profile_pending(info: &NvidiaRuntimeInfo) -> bool {
 /// Each of these needs recovery before any other profile group, as handled by
 /// `recover_pending`.
 fn reports_recovery(info: &NvidiaRuntimeInfo) -> bool {
-    profile_pending(info) || info.recovery_required || (!info.available && info.managed)
+    profile_pending(info)
+        || info.recovery_required
+        || (info.capabilities.rail_probe != 1 && !info.available && info.managed)
 }
 
 fn validate_token(value: &str) -> anyhow::Result<()> {
@@ -821,11 +1188,15 @@ async fn invoke_process(
                 "NVIDIA runtime helper failed ({status}): {}",
                 String::from_utf8_lossy(&stderr)
             );
-            return Err(if typed_refusal(&stderr) {
-                HelperRefused(error).into()
-            } else {
-                error
-            });
+            return Err(
+                if !request.action.may_write() && typed_unsupported(&stderr) {
+                    unavailable(error)
+                } else if typed_refusal(&stderr) {
+                    HelperRefused(error).into()
+                } else {
+                    error
+                },
+            );
         }
         let info: NvidiaRuntimeInfo =
             serde_json::from_slice(&stdout).context("Invalid NVIDIA runtime helper JSON")?;
@@ -888,6 +1259,19 @@ fn typed_refusal(stderr: &[u8]) -> bool {
         .is_some_and(|value| {
             value.get("protocol_version") == Some(&serde_json::json!(PROTOCOL_VERSION))
                 && value.get("error").is_some_and(serde_json::Value::is_string)
+        })
+}
+
+fn typed_unsupported(stderr: &[u8]) -> bool {
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .is_some_and(|value| {
+            value.get("protocol_version") == Some(&serde_json::json!(PROTOCOL_VERSION))
+                && value.get("error").and_then(serde_json::Value::as_str)
+                    == Some("UnsupportedError")
         })
 }
 
@@ -1286,9 +1670,11 @@ mod tests {
             ("time.sleep(30)", 300),
         ] {
             let (_dir, runtime) = fake(body, timeout_ms);
-            let error = runtime.stage(None).await.unwrap_err();
-            assert!(is_unavailable(&error), "{error:#}");
-            assert!(is_unavailable(&error.context("caller context")));
+            let transaction = runtime.stage(None).await.unwrap();
+            assert!(transaction.deferral().is_some());
+            assert!(!transaction.is_staged());
+            assert!(runtime.pending.lock().await.is_none());
+            assert!(!runtime.guard.recovery_outstanding.load(Ordering::SeqCst));
         }
         let (_dir, runtime) = fake("pass", 2000);
         let mut settings = NvidiaRailControls::default();
@@ -1452,6 +1838,195 @@ mod tests {
         reloaded.config.executable = reloaded.config.state_dir.join("missing-helper");
         let error = reloaded.prepare_apply(None, |_| Ok(())).await.unwrap_err();
         assert!(!is_unavailable(&error), "{error:#}");
+    }
+
+    fn probe_reply(can_stage: bool, owned: bool) -> String {
+        serde_json::json!({"protocol_version":1,"available":!owned,
+            "device":{"uuid":"GPU-test","bdf":"0000:09:00.0"},"managed":owned,
+            "recovery_required":false,"rails":[],"capabilities":{"profile_transactions":1,"rail_probe":1},
+            "can_stage":can_stage,"ownership_unavailable":owned,
+            "deferred_fields":if can_stage {vec![]} else {vec![serde_json::json!({
+                "rail":"MSVDD","field":"max_voltage_uv","operation":"set","reason":"driver has no writable MSVDD control"})]}
+        }).to_string()
+    }
+
+    #[tokio::test]
+    async fn clean_probe_skips_full_bundle_and_keeps_owned_state_without_any_write_action() {
+        let reply = probe_reply(false, true);
+        let (dir, runtime) = fake(
+            &format!(
+                "with open(os.path.join(state_dir,'calls'),'a') as f: f.write(r['action']+'\\n')\nassert r['action'] in ('status','probe')\nif r['action']=='probe': assert r['settings']['nvvdd']['max_voltage_uv']==1125000 and r['settings']['msvdd']['max_voltage_uv']==950000\nprint({reply:?})"
+            ),
+            2000,
+        );
+        let mut settings = NvidiaRailControls::default();
+        settings.nvvdd.max_voltage_uv = Some(1_125_000);
+        settings.msvdd.max_voltage_uv = Some(950_000);
+        let decision = runtime
+            .prepare_apply(Some(&settings), |unknown| {
+                assert!(!unknown);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let RailPreparation::Deferred(reason) = decision else {
+            panic!("expected rail deferral");
+        };
+        assert!(reason.ownership_unavailable);
+        assert_eq!(reason.fields[0].rail, NvidiaRail::Msvdd);
+        let transaction = runtime.stage(Some(&settings)).await.unwrap();
+        assert!(transaction.deferral().is_some());
+        runtime.commit(&transaction).await.unwrap();
+        runtime.rollback(&transaction).await.unwrap();
+        assert!(
+            fs::read_to_string(dir.path().join("calls"))
+                .unwrap()
+                .lines()
+                .all(|action| matches!(action, "status" | "probe"))
+        );
+        assert!(!runtime.guard.recovery_outstanding.load(Ordering::SeqCst));
+        assert!(runtime.pending.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn stage_reprobe_can_defer_without_a_checkpoint_and_clears_the_write_latch() {
+        let ready = probe_reply(true, false);
+        let (dir, runtime) = fake(
+            &format!(
+                "with open(os.path.join(state_dir,'calls'),'a') as f: f.write(r['action']+'\\n')\nreply=json.loads({ready:?})\nif r['action']=='stage':\n reply.update(can_stage=False,transaction_status='unavailable',request_id=r['request_id'],deferred_fields=[dict(rail='NVVDD',field='max_voltage_uv',operation='set',reason='became unsupported')])\nprint(json.dumps(reply))"
+            ),
+            2000,
+        );
+        let mut settings = NvidiaRailControls::default();
+        settings.nvvdd.max_voltage_uv = Some(1_125_000);
+        let transaction = runtime.stage(Some(&settings)).await.unwrap();
+        assert!(!transaction.is_staged());
+        assert!(transaction.deferral().is_some());
+        assert!(runtime.pending.lock().await.is_none());
+        assert!(!runtime.guard.recovery_outstanding.load(Ordering::SeqCst));
+        runtime.commit(&transaction).await.unwrap();
+        assert!(
+            !fs::read_to_string(dir.path().join("calls"))
+                .unwrap()
+                .lines()
+                .any(|action| matches!(action, "commit" | "apply" | "restore"))
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_preflight_is_typed_while_unsupported_writer_stays_fail_closed() {
+        let error =
+            r#"{"protocol_version":1,"error":"UnsupportedError","message":"arbitrary text"}"#;
+        let (_dir, runtime) = fake(&format!("sys.stderr.write({error:?})\nsys.exit(2)"), 2000);
+        let preflight = runtime.prepare_apply(None, |_| Ok(())).await.unwrap_err();
+        assert!(is_unavailable(&preflight));
+        assert!(runtime.apply(None).await.is_err());
+        let after_write = runtime.prepare_apply(None, |_| Ok(())).await.unwrap_err();
+        assert!(!is_unavailable(&after_write));
+        let refused = error.replace("UnsupportedError", "ValidationError");
+        let (_dir, runtime) = fake(&format!("sys.stderr.write({refused:?})\nsys.exit(2)"), 2000);
+        assert!(!is_unavailable(
+            &runtime.prepare_apply(None, |_| Ok(())).await.unwrap_err()
+        ));
+    }
+
+    #[tokio::test]
+    async fn legacy_one_rail_writable_and_one_absent_skips_every_rail_without_stage() {
+        let reply = RESPONSE.replace("\"rails\":[]", "\"rails\":[{\"rail\":\"NVVDD\",\"max_voltage\":{\"evaluated_uv\":950000,\"offset_uv\":0,\"writable\":true}}]");
+        let (dir, runtime) = fake(
+            &format!(
+                "with open(os.path.join(state_dir,'calls'),'a') as f: f.write(r['action']+'\\n')\nprint({reply:?})"
+            ),
+            2000,
+        );
+        let mut settings = NvidiaRailControls::default();
+        settings.nvvdd.max_voltage_uv = Some(1_125_000);
+        settings.msvdd.max_voltage_uv = Some(950_000);
+        let transaction = runtime.stage(Some(&settings)).await.unwrap();
+        let skipped = transaction.deferral().unwrap();
+        assert_eq!(skipped.fields.len(), 2);
+        assert_eq!(skipped.fields[0].rail, NvidiaRail::Nvvdd);
+        assert_eq!(skipped.fields[1].rail, NvidiaRail::Msvdd);
+        runtime.commit(&transaction).await.unwrap();
+        assert!(
+            fs::read_to_string(dir.path().join("calls"))
+                .unwrap()
+                .lines()
+                .all(|action| action == "status")
+        );
+    }
+
+    #[test]
+    fn new_probe_clean_ownership_is_not_legacy_recovery_and_invalid_fields_are_refused() {
+        let mut info: NvidiaRuntimeInfo = serde_json::from_str(&probe_reply(false, true)).unwrap();
+        assert!(!reports_recovery(&info));
+        assert!(matches!(
+            probe_preparation(&info).unwrap(),
+            RailPreparation::Deferred(_)
+        ));
+        info.capabilities.rail_probe = 0;
+        assert!(reports_recovery(&info));
+        info.capabilities.rail_probe = 1;
+        info.deferred_fields.push(info.deferred_fields[0].clone());
+        assert!(probe_preparation(&info).is_err());
+        info.deferred_fields.pop();
+        info.recovery_required = true;
+        assert!(reports_recovery(&info));
+        assert!(probe_preparation(&info).is_err());
+    }
+
+    #[tokio::test]
+    async fn late_read_only_status_failure_defers_without_creating_a_checkpoint() {
+        let supported = RESPONSE.replace("\"rails\":[]", "\"rails\":[{\"rail\":\"NVVDD\",\"max_voltage\":{\"evaluated_uv\":950000,\"offset_uv\":0,\"writable\":true}}]");
+        let (dir, runtime) = fake(
+            &format!(
+                "p=os.path.join(state_dir,'count')\nn=int(open(p).read()) if os.path.exists(p) else 0\nopen(p,'w').write(str(n+1))\nassert r['action']=='status'\nif n: sys.stderr.write('{{\"protocol_version\":1,\"error\":\"UnsupportedError\",\"message\":\"late read failure\"}}'); sys.exit(2)\nprint({supported:?})"
+            ),
+            2000,
+        );
+        let mut settings = NvidiaRailControls::default();
+        settings.nvvdd.max_voltage_uv = Some(950000);
+        let transaction = runtime.stage(Some(&settings)).await.unwrap();
+        assert!(transaction.deferral().is_some());
+        assert_eq!(fs::read_to_string(dir.path().join("count")).unwrap(), "2");
+        assert!(runtime.pending.lock().await.is_none());
+        assert!(!runtime.guard.recovery_outstanding.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn explicit_release_of_unreadable_committed_ownership_is_deferred_without_restore_calls()
+    {
+        let mut reply: serde_json::Value = serde_json::from_str(&probe_reply(false, true)).unwrap();
+        reply["deferred_fields"][0]["operation"] = "restore".into();
+        let reply = reply.to_string();
+        let (dir, runtime) = fake(
+            &format!(
+                "with open(os.path.join(state_dir,'calls'),'a') as f: f.write(r['action']+'\\n')\nassert r['action'] in ('status','probe')\nprint({reply:?})"
+            ),
+            2000,
+        );
+        assert!(matches!(
+            runtime
+                .prepare_apply(None, |unknown| {
+                    assert!(!unknown);
+                    Ok(())
+                })
+                .await
+                .unwrap(),
+            RailPreparation::Deferred(_)
+        ));
+        let transaction = runtime.stage(None).await.unwrap();
+        assert_eq!(
+            transaction.deferral().unwrap().fields[0].operation,
+            NvidiaRailOperation::Restore
+        );
+        runtime.commit(&transaction).await.unwrap();
+        assert!(
+            fs::read_to_string(dir.path().join("calls"))
+                .unwrap()
+                .lines()
+                .all(|action| matches!(action, "status" | "probe"))
+        );
     }
 }
 
