@@ -1079,10 +1079,14 @@ impl<'a> Handler {
             }
         }
 
-        self.cleanup_inner().await;
+        self.cleanup_controllers(true).await;
         self.config.write().await.current_profile = name;
 
-        let reconciled = self.apply_current_config_inner().await;
+        let reconciled = {
+            let config = self.config.read().await;
+            let controllers = self.gpu_controllers.read().await;
+            reconcile_controllers(&controllers, &config, true).await
+        };
 
         let hooks = async {
             if let Some(deactivated) = &deactivation_hook {
@@ -1432,10 +1436,17 @@ impl<'a> Handler {
     }
 
     async fn cleanup_inner(&self) {
+        self.cleanup_controllers(false).await;
+    }
+
+    async fn cleanup_controllers(&self, profile_transition: bool) {
         let disable_clocks_cleanup = self.config.read().await.daemon.disable_clocks_cleanup;
 
         let controllers = self.gpu_controllers.read().await;
         for (id, controller) in controllers.iter() {
+            if profile_transition && controller.supports_incremental_profile_switch() {
+                continue;
+            }
             if let Err(err) = controller.prepare_reset().await {
                 error!("could not recover controller {id} before cleanup: {err:#}");
                 release_fan_control(id, controller.as_ref()).await;
@@ -1525,18 +1536,40 @@ async fn apply_config_to_controllers(
     controllers: &BTreeMap<String, Box<dyn GpuController>>,
     config: &Config,
 ) -> anyhow::Result<()> {
+    reconcile_controllers(controllers, config, false).await
+}
+
+async fn reconcile_controllers(
+    controllers: &BTreeMap<String, Box<dyn GpuController>>,
+    config: &Config,
+    profile_transition: bool,
+) -> anyhow::Result<()> {
     let gpus = config.gpus()?;
     let mut failures = Vec::new();
     for (id, controller) in controllers {
         let result = if let Some(gpu_config) = gpus.get(id) {
             debug!("applying config {gpu_config:#?} to controller {id}");
             controller.apply_config(gpu_config).await
+        } else if profile_transition && controller.supports_incremental_profile_switch() {
+            // An omitted GPU needs defaults once, not a default Apply followed
+            // by cleanup and another helper restore. Always stop its old fan loop.
+            let result = controller.apply_config(&GpuConfig::default()).await;
+            release_fan_control(id, controller.as_ref()).await;
+            result
         } else {
             // A removed GPU/profile entry still releases externally managed
             // controls, without resetting its unrelated GPU settings.
             controller.restore_runtime_controls().await
         };
         if let Err(err) = result.or_else(accept_partial_apply) {
+            // An incremental transition skips the earlier cleanup. If the new
+            // configuration fails, still hand its old fan loop back to the driver.
+            if profile_transition
+                && gpus.contains_key(id)
+                && controller.supports_incremental_profile_switch()
+            {
+                release_fan_control(id, controller.as_ref()).await;
+            }
             error!("could not reconcile config for gpu {id}: {err:#}");
             failures.push(format!("{id}: {err:#}"));
         }
@@ -1886,6 +1919,7 @@ mod runtime_config_reconciliation_tests {
     enum Call {
         Apply(&'static str, Option<f64>),
         Restore(&'static str),
+        ReleaseFans(&'static str),
     }
 
     struct RecordingController {
@@ -1893,6 +1927,7 @@ mod runtime_config_reconciliation_tests {
         calls: Rc<RefCell<Vec<Call>>>,
         fail: bool,
         gate: Option<Rc<ApplyGate>>,
+        incremental: bool,
     }
 
     struct ApplyGate {
@@ -1915,6 +1950,16 @@ mod runtime_config_reconciliation_tests {
         }
         fn friendly_name(&self) -> Option<String> {
             None
+        }
+        fn supports_incremental_profile_switch(&self) -> bool {
+            self.incremental
+        }
+        fn release_fan_control(&self) -> LocalBoxFuture<'_, anyhow::Result<()>> {
+            async move {
+                self.calls.borrow_mut().push(Call::ReleaseFans(self.name));
+                Ok(())
+            }
+            .boxed_local()
         }
         fn apply_config<'a>(
             &'a self,
@@ -1982,6 +2027,7 @@ mod runtime_config_reconciliation_tests {
                         calls: calls.clone(),
                         fail: *fail,
                         gate: None,
+                        incremental: false,
                     }) as Box<dyn GpuController>,
                 )
             })
@@ -2070,6 +2116,7 @@ mod runtime_config_reconciliation_tests {
             calls: Rc::default(),
             fail,
             gate: Some(gate.clone()),
+            incremental: false,
         };
         let mut config = Config::default();
         config.apply_settings_timer = apply_timer;
@@ -2114,6 +2161,118 @@ mod runtime_config_reconciliation_tests {
         GpuConfig {
             power_cap: Some(cap),
             ..GpuConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn incremental_profile_switch_only_cleans_legacy_and_omitted_controllers() {
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let mut config = Config::default();
+        config.daemon.disable_clocks_cleanup = true;
+        let mut next = Profile::default();
+        next.gpus.insert("kept".into(), gpu_config(230.0));
+        next.gpus.insert("legacy".into(), gpu_config(240.0));
+        config.profiles.insert(Rc::from("next"), next);
+        let controllers = [("kept", true), ("legacy", false), ("omitted", true)]
+            .into_iter()
+            .map(|(name, incremental)| {
+                config
+                    .gpus_mut()
+                    .unwrap()
+                    .insert(name.into(), gpu_config(100.0));
+                (
+                    name.into(),
+                    Box::new(RecordingController {
+                        name,
+                        calls: calls.clone(),
+                        fail: false,
+                        gate: None,
+                        incremental,
+                    }) as DynGpuController,
+                )
+            })
+            .collect();
+        let handler = handler_with(config, controllers);
+        handler
+            .set_current_profile_inner(Some(Rc::from("next")))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            *calls.borrow(),
+            [
+                Call::Apply("legacy", None),
+                Call::Apply("kept", Some(230.0)),
+                Call::Apply("legacy", Some(240.0)),
+                Call::Apply("omitted", None),
+                Call::ReleaseFans("omitted"),
+            ]
+        );
+        calls.borrow_mut().clear();
+        handler
+            .set_current_profile_inner(None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            *calls.borrow(),
+            [
+                Call::Apply("legacy", None),
+                Call::Apply("kept", Some(100.0)),
+                Call::Apply("legacy", Some(100.0)),
+                Call::Apply("omitted", Some(100.0)),
+            ]
+        );
+        calls.borrow_mut().clear();
+        handler.cleanup_inner().await;
+        assert_eq!(
+            *calls.borrow(),
+            [
+                Call::Apply("kept", None),
+                Call::Apply("legacy", None),
+                Call::Apply("omitted", None),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn incremental_profile_failure_releases_fans_once_for_kept_and_omitted_gpus() {
+        for present in [true, false] {
+            let calls = Rc::new(RefCell::new(Vec::new()));
+            let mut config = Config::default();
+            let mut next = Profile::default();
+            if present {
+                next.gpus.insert("gpu".into(), gpu_config(230.0));
+            }
+            config.profiles.insert(Rc::from("next"), next);
+            let controller = RecordingController {
+                name: "gpu",
+                calls: calls.clone(),
+                fail: true,
+                gate: None,
+                incremental: true,
+            };
+            let handler = handler_with(
+                config,
+                BTreeMap::from([("gpu".into(), Box::new(controller) as DynGpuController)]),
+            );
+            let error = handler
+                .set_current_profile_inner(Some(Rc::from("next")))
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert!(error.to_string().contains("synthetic apply failure"));
+            assert_eq!(
+                *calls.borrow(),
+                [
+                    Call::Apply("gpu", present.then_some(230.0)),
+                    Call::ReleaseFans("gpu")
+                ]
+            );
+            assert_eq!(
+                handler.config.read().await.current_profile.as_deref(),
+                Some("next")
+            );
         }
     }
 
