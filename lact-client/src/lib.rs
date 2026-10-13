@@ -78,6 +78,25 @@ impl DaemonClient {
         })
     }
 
+    /// Open a separate RPC stream to this client's endpoint for optional reads.
+    /// Embedded and unnamed socketpair connections keep their existing stream.
+    pub async fn independent_connection(&self) -> anyhow::Result<Self> {
+        if self.embedded {
+            return Ok(self.clone());
+        }
+        let stream = self.stream.lock().await;
+        if !stream.supports_independent_connection() {
+            return Ok(self.clone());
+        }
+        let connection = stream.new_connection().await?;
+        Ok(Self {
+            stream: Rc::new(Mutex::new(connection)),
+            status_tx: broadcast::Sender::new(STATUS_MSG_CHANNEL_SIZE),
+            reconnect: self.reconnect,
+            embedded: self.embedded,
+        })
+    }
+
     pub fn status_receiver(&self) -> broadcast::Receiver<ConnectionStatusMsg> {
         self.status_tx.subscribe()
     }
