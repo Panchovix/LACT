@@ -209,6 +209,26 @@ Steps:
 - `make`
 - `sudo make install`
 
+Installation uses `PREFIX` (default `/usr/local`) for the binary and the absolute
+executable paths in the service and desktop entry. If the build uses a custom
+`CARGO_TARGET_DIR`, pass the same value to `make install`. `DESTDIR` stages files
+without changing the executable paths used at runtime.
+
+On SELinux systems, a manually copied executable must have the destination's
+policy context. Copying extended attributes from a home-directory build can
+leave `user_home_t` on the installed binary and cause systemd's `203/EXEC` error.
+For the default installation, restore and verify the context with
+`sudo restorecon -F /usr/local/bin/lact` and `matchpathcon -V /usr/local/bin/lact`.
+An atomic installer should copy bytes without source extended attributes and
+apply the final destination's policy context to the staged file before renaming
+it, including when restoring an older executable.
+
+After changing the service definition, run `sudo systemctl daemon-reload`.
+This updates the next start command without restarting LACT. Check
+`systemctl show lactd -p ExecStart -p MainPID`; the running process's executable
+is `/proc/<MainPID>/exe`. Restart the service in a suitable GPU workload window
+and reopen the GUI so both use the intended installation.
+
 It's possible to change which features LACT gets built with. To do so, replace
 the `make` command with the following variation:
 
