@@ -45,7 +45,7 @@ use gtk::glib::{self, ControlFlow, clone};
 use i18n_embed_fl::fl;
 use lact_client::{ConnectionStatusMsg, DaemonClient};
 use lact_schema::{
-    DeviceApiInfo, DeviceFlag, DeviceListEntry, DeviceStats, DeviceType, SystemInfo,
+    DeviceApiInfo, DeviceFlag, DeviceInfo, DeviceListEntry, DeviceStats, DeviceType, SystemInfo,
     args::GuiArgs,
     config::{GpuConfig, Profile},
     request::{ConfirmCommand, ProfileBase, SetClocksCommand},
@@ -101,8 +101,68 @@ macro_rules! setup_actions {
     };
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ApiInfoRequest {
+    gpu_id: String,
+    generation: u64,
+}
+
+#[derive(Default)]
+struct ApiInfoRequests {
+    generation: u64,
+    current: Option<ApiInfoRequest>,
+    in_flight: Option<ApiInfoRequest>,
+    pending: Option<ApiInfoRequest>,
+}
+
+impl ApiInfoRequests {
+    fn select(&mut self, gpu_id: &str) -> ApiInfoRequest {
+        self.generation = self.generation.wrapping_add(1);
+        let request = ApiInfoRequest {
+            gpu_id: gpu_id.to_owned(),
+            generation: self.generation,
+        };
+        self.current = Some(request.clone());
+        self.pending = None;
+        request
+    }
+
+    fn invalidate(&mut self) {
+        self.current = None;
+        self.pending = None;
+    }
+
+    fn queue(&mut self, request: ApiInfoRequest) -> Option<ApiInfoRequest> {
+        if self.current.as_ref() != Some(&request) || self.in_flight.as_ref() == Some(&request) {
+            return None;
+        }
+        if self.in_flight.is_some() {
+            self.pending = Some(request);
+            None
+        } else {
+            self.in_flight = Some(request.clone());
+            Some(request)
+        }
+    }
+
+    fn finish(&mut self, request: &ApiInfoRequest) -> (bool, Option<ApiInfoRequest>) {
+        if self.in_flight.as_ref() != Some(request) {
+            return (false, None);
+        }
+        self.in_flight = None;
+        let current = self.current.as_ref() == Some(request);
+        let next = self
+            .pending
+            .take()
+            .filter(|pending| self.current.as_ref() == Some(pending));
+        self.in_flight = next.clone();
+        (current, next)
+    }
+}
+
 pub struct AppModel {
     daemon_client: DaemonClient,
+    api_info_requests: ApiInfoRequests,
     graphs_window: relm4::Controller<GraphsWindow>,
     process_monitor_window: relm4::Controller<ProcessMonitorWindow>,
     overdrive_dialog: relm4::Controller<OverdriveDialog>,
@@ -497,6 +557,7 @@ impl AsyncComponent for AppModel {
 
         let mut model = AppModel {
             daemon_client,
+            api_info_requests: ApiInfoRequests::default(),
             graphs_window,
             process_monitor_window,
             overdrive_dialog,
@@ -641,6 +702,7 @@ impl AppModel {
                 }
             }
             AppMsg::SelectGpu(gpu_id) => {
+                self.api_info_requests.invalidate();
                 Self::set_selected_gpu_id(gpu_id);
                 sender.input(AppMsg::ReloadData { full: true });
             }
@@ -651,7 +713,7 @@ impl AppModel {
                 if full {
                     self.update_gpu_data_full(gpu_id, sender).await?;
                 } else {
-                    self.update_gpu_data(gpu_id, sender).await?;
+                    self.update_gpu_data(gpu_id, sender, None).await?;
                 }
             }
             AppMsg::RefreshNvidiaRuntime => {
@@ -667,19 +729,35 @@ impl AppModel {
                     info: info.nvidia_runtime.map(Box::new),
                 });
             }
-            AppMsg::ReloadApiInfo => {
-                let gpu_id = Self::get_selected_gpu_id()?;
-                match self.daemon_client.get_device_api_info(&gpu_id).await {
-                    Ok(api_info) => {
-                        self.software_page
-                            .emit(SoftwarePageMsg::DeviceApiInfo(Some(api_info)));
-                    }
-                    Err(err) => {
-                        error!("could not fetch API info: {err:#}");
-                        self.software_page.emit(SoftwarePageMsg::DeviceApiInfo(Some(
-                            DeviceApiInfo::default(),
-                        )));
-                    }
+            AppMsg::ReloadApiInfo { gpu_id, generation } => {
+                if Self::get_selected_gpu_id().is_ok_and(|id| id == gpu_id)
+                    && let Some(request) = self
+                        .api_info_requests
+                        .queue(ApiInfoRequest { gpu_id, generation })
+                {
+                    self.start_api_info_request(request, &sender);
+                }
+            }
+            AppMsg::ApiInfoLoaded {
+                gpu_id,
+                generation,
+                result,
+            } => {
+                let request = ApiInfoRequest { gpu_id, generation };
+                let (current, next) = self.api_info_requests.finish(&request);
+                if current && Self::get_selected_gpu_id().is_ok_and(|id| id == request.gpu_id) {
+                    let api_info = match result {
+                        Ok(info) => info,
+                        Err(err) => {
+                            error!("could not fetch API info: {err:#}");
+                            DeviceApiInfo::default()
+                        }
+                    };
+                    self.software_page
+                        .emit(SoftwarePageMsg::DeviceApiInfo(Some(api_info)));
+                }
+                if let Some(request) = next {
+                    self.start_api_info_request(request, &sender);
                 }
             }
             AppMsg::ShowPreferencesDialog => {
@@ -1052,6 +1130,28 @@ impl AppModel {
             .context("No GPU selected")
     }
 
+    fn start_api_info_request(
+        &self,
+        request: ApiInfoRequest,
+        sender: &AsyncComponentSender<AppModel>,
+    ) {
+        let client = self.daemon_client.clone();
+        let sender = sender.clone();
+        relm4::spawn_local(async move {
+            let result = async {
+                let client = client.independent_connection().await?;
+                client.get_device_api_info(&request.gpu_id).await
+            }
+            .await
+            .map_err(Arc::new);
+            sender.input(AppMsg::ApiInfoLoaded {
+                gpu_id: request.gpu_id,
+                generation: request.generation,
+                result,
+            });
+        });
+    }
+
     async fn reload_profiles(
         &mut self,
         state_sender: Option<relm4::Sender<ProfileRuleRowMsg>>,
@@ -1079,6 +1179,7 @@ impl AppModel {
         sender: AsyncComponentSender<AppModel>,
     ) -> anyhow::Result<()> {
         self.ui_sensitive.set_value(false);
+        let api_request = self.api_info_requests.select(&gpu_id);
         self.software_page
             .emit(SoftwarePageMsg::DeviceApiInfo(None));
 
@@ -1114,7 +1215,10 @@ impl AppModel {
             initial: true,
         });
 
-        sender.input(AppMsg::ReloadApiInfo);
+        sender.input(AppMsg::ReloadApiInfo {
+            gpu_id: api_request.gpu_id,
+            generation: api_request.generation,
+        });
 
         self.thermals_page.emit(ThermalsPageMsg::Update {
             update: update.clone(),
@@ -1139,7 +1243,9 @@ impl AppModel {
             .unwrap_or_default();
         self.displays_page.emit(displays_info);
 
-        let stats = self.update_gpu_data(gpu_id.clone(), sender).await?;
+        let stats = self
+            .update_gpu_data(gpu_id.clone(), sender, Some(info))
+            .await?;
 
         self.graphs_window.emit(GraphsWindowMsg::Stats {
             stats,
@@ -1155,6 +1261,7 @@ impl AppModel {
         &mut self,
         gpu_id: String,
         sender: AsyncComponentSender<AppModel>,
+        prefetched_info: Option<Arc<DeviceInfo>>,
     ) -> anyhow::Result<Arc<DeviceStats>> {
         if let Some(stop) = self.stats_task_stop.take() {
             let _ = stop.send(());
@@ -1168,12 +1275,15 @@ impl AppModel {
             .await
             .context("Could not fetch GPU configuration; existing controls were preserved")?;
 
-        let info = self
-            .daemon_client
-            .get_device_info(&gpu_id, Some(false))
-            .await
-            .context("Could not fetch info")?;
-        let info = Arc::new(info);
+        let info = match prefetched_info {
+            Some(info) => info,
+            None => Arc::new(
+                self.daemon_client
+                    .get_device_info(&gpu_id, Some(false))
+                    .await
+                    .context("Could not fetch info")?,
+            ),
+        };
 
         self.oc_page.emit(OcPageMsg::Update {
             update: PageUpdate::Info(info),
@@ -1623,3 +1733,56 @@ new_stateless_action!(pub ServiceSetupAction, AppActionGroup, "service-setup");
 new_stateless_action!(pub PreferencesAction, AppActionGroup, "preferences");
 new_stateless_action!(pub AboutAction, AppActionGroup, "about");
 new_stateless_action!(pub QuitAction, AppActionGroup, "quit");
+
+#[cfg(test)]
+mod api_info_tests {
+    use super::ApiInfoRequests;
+
+    #[test]
+    fn rapid_gpu_changes_only_start_the_latest_request_after_completion() {
+        let mut requests = ApiInfoRequests::default();
+        let first = requests.select("GPU-A");
+        assert_eq!(requests.queue(first.clone()), Some(first.clone()));
+        assert!(requests.queue(first.clone()).is_none());
+        for index in 0..20 {
+            let next = requests.select(&format!("GPU-{index}"));
+            assert!(requests.queue(next).is_none());
+            assert_eq!(requests.in_flight.as_ref(), Some(&first));
+        }
+        let latest = requests.current.clone().unwrap();
+        assert_eq!(requests.finish(&first), (false, Some(latest.clone())));
+        assert_eq!(requests.in_flight.as_ref(), Some(&latest));
+        assert_eq!(requests.finish(&latest), (true, None));
+        assert!(requests.in_flight.is_none());
+    }
+
+    #[test]
+    fn same_gpu_reload_discards_old_generations_and_queued_messages() {
+        let mut requests = ApiInfoRequests::default();
+        let old = requests.select("GPU-A");
+        requests.queue(old.clone());
+        let current = requests.select("GPU-A");
+        assert_ne!(old.generation, current.generation);
+        assert!(requests.queue(old.clone()).is_none());
+        assert!(requests.queue(current.clone()).is_none());
+        assert_eq!(requests.finish(&old), (false, Some(current.clone())));
+        // A repeated old completion must not release the new in-flight request.
+        assert_eq!(requests.finish(&old), (false, None));
+        assert_eq!(requests.in_flight.as_ref(), Some(&current));
+        assert_eq!(requests.finish(&current), (true, None));
+    }
+
+    #[test]
+    fn selection_invalidates_old_results_before_the_full_reload_runs() {
+        let mut requests = ApiInfoRequests::default();
+        let first = requests.select("GPU-A");
+        requests.queue(first.clone());
+        let old_pending = requests.select("GPU-B");
+        requests.queue(old_pending.clone());
+        requests.invalidate();
+        assert!(requests.queue(old_pending).is_none());
+        assert_eq!(requests.finish(&first), (false, None));
+        let latest = requests.select("GPU-C");
+        assert_eq!(requests.queue(latest.clone()), Some(latest));
+    }
+}
