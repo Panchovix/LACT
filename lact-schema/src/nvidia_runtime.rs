@@ -97,11 +97,13 @@ pub struct NvidiaRuntimeCapabilities {
     pub profile_transactions: u32,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub rail_probe: u32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub metadata_status: u32,
 }
 
 impl NvidiaRuntimeCapabilities {
     pub fn is_empty(&self) -> bool {
-        self.profile_transactions == 0 && self.rail_probe == 0
+        self.profile_transactions == 0 && self.rail_probe == 0 && self.metadata_status == 0
     }
 }
 
@@ -311,5 +313,25 @@ mod tests {
         assert_eq!(info.capabilities.rail_probe, 1);
         wire["deferred_fields"][0]["field"] = "arbitrary_native_field".into();
         assert!(serde_json::from_value::<NvidiaRuntimeInfo>(wire).is_err());
+    }
+
+    #[test]
+    fn metadata_capability_is_optional_and_versioned() {
+        let legacy: NvidiaRuntimeCapabilities = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy.metadata_status, 0);
+        assert!(legacy.is_empty());
+        let modern: NvidiaRuntimeCapabilities =
+            serde_json::from_str(r#"{"metadata_status":1}"#).unwrap();
+        assert_eq!(modern.metadata_status, 1);
+        assert!(!modern.is_empty());
+        assert!(
+            !serde_json::to_string(&legacy)
+                .unwrap()
+                .contains("metadata_status")
+        );
+        assert!(
+            serde_json::from_str::<NvidiaRuntimeCapabilities>(r#"{"metadata_status":"1"}"#)
+                .is_err()
+        );
     }
 }

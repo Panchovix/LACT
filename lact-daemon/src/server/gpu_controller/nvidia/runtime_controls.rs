@@ -159,6 +159,61 @@ pub(super) enum RailPreparation {
     Deferred(RailDeferral),
 }
 
+/// A single Apply's read-only preparation, consumed when its Rails step starts.
+#[derive(Debug)]
+pub(super) struct PreparedRails {
+    pub(super) decision: RailPreparation,
+    modern_ticket: Option<ModernStageTicket>,
+}
+
+impl PreparedRails {
+    pub(super) fn ready() -> Self {
+        Self {
+            decision: RailPreparation::Ready,
+            modern_ticket: None,
+        }
+    }
+    pub(super) fn deferred(reason: RailDeferral) -> Self {
+        Self {
+            decision: RailPreparation::Deferred(reason),
+            modern_ticket: None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ModernStageTicket {
+    owner: Arc<()>,
+    device: NvidiaRuntimeDevice,
+    settings: Option<NvidiaRailControls>,
+    executable: ExecutableIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExecutableIdentity {
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+    size: u64,
+    ctime: (i64, i64),
+    mtime: (i64, i64),
+}
+
+impl ExecutableIdentity {
+    fn read(path: &Path) -> anyhow::Result<Self> {
+        let path = checked_executable(path)?;
+        let metadata = fs::metadata(&path)?;
+        Ok(Self {
+            path,
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            size: metadata.len(),
+            ctime: (metadata.ctime(), metadata.ctime_nsec()),
+            mtime: (metadata.mtime(), metadata.mtime_nsec()),
+        })
+    }
+}
+
 fn requested_fields(settings: Option<&NvidiaRailControls>) -> Vec<(NvidiaRail, NvidiaRailField)> {
     let mut fields = Vec::new();
     if let Some(settings) = settings {
@@ -332,6 +387,8 @@ pub(super) struct RuntimeControls {
     device: NvidiaRuntimeDevice,
     guard: Arc<DeviceGuard>,
     pending: Mutex<Option<RuntimeTransaction>>,
+    preparation_owner: Arc<()>,
+    metadata_hint: Mutex<Option<ExecutableIdentity>>,
     reap_timeout: Duration,
 }
 
@@ -367,6 +424,7 @@ fn device_guard(device: &NvidiaRuntimeDevice) -> Arc<DeviceGuard> {
 #[serde(rename_all = "lowercase")]
 enum Action {
     Status,
+    Metadata,
     Probe,
     Apply,
     Restore,
@@ -378,7 +436,7 @@ enum Action {
 impl Action {
     /// Whether an unconfirmed call may have changed native helper state.
     fn may_write(self) -> bool {
-        !matches!(self, Self::Status | Self::Probe)
+        !matches!(self, Self::Status | Self::Metadata | Self::Probe)
     }
 }
 
@@ -446,6 +504,8 @@ impl RuntimeControls {
             device,
             guard,
             pending: Mutex::new(None),
+            preparation_owner: Arc::new(()),
+            metadata_hint: Mutex::new(None),
             reap_timeout: REAP_TIMEOUT,
         }
     }
@@ -545,9 +605,14 @@ impl RuntimeControls {
 
     /// A checkpoint from another controller instance needs frequency discovery
     /// before an explicit release can lower its rail policies.
+    #[cfg(test)]
     pub(super) async fn has_unknown_profile_transaction(&self) -> anyhow::Result<bool> {
         let info = self.invoke(Action::Status, None).await?;
-        if info.transaction_id.is_none() || !profile_pending(&info) {
+        self.unknown_profile_transaction(&info).await
+    }
+
+    async fn unknown_profile_transaction(&self, info: &NvidiaRuntimeInfo) -> anyhow::Result<bool> {
+        if info.transaction_id.is_none() || !profile_pending(info) {
             return Ok(false);
         }
         ensure!(
@@ -600,12 +665,34 @@ impl RuntimeControls {
         &self,
         settings: Option<&NvidiaRailControls>,
         recover_frequencies: impl FnOnce(bool) -> anyhow::Result<()>,
-    ) -> anyhow::Result<RailPreparation> {
+    ) -> anyhow::Result<PreparedRails> {
         self.guard_own_pending(async {
             self.validate(settings)?;
-            self.recover_unguarded(settings.is_none(), recover_frequencies)
+            let executable =
+                ExecutableIdentity::read(&self.config.executable).map_err(unavailable)?;
+            let info = self
+                .recover_unguarded(settings.is_none(), recover_frequencies)
                 .await?;
-            self.preflight_rails(settings).await
+            let (decision, fresh) = self.preflight_from_info(settings, info).await?;
+            let modern_ticket = if decision == RailPreparation::Ready
+                && fresh.capabilities.profile_transactions == 1
+                && fresh.capabilities.rail_probe == 1
+                && ExecutableIdentity::read(&self.config.executable).map_err(unavailable)?
+                    == executable
+            {
+                Some(ModernStageTicket {
+                    owner: self.preparation_owner.clone(),
+                    device: self.device.clone(),
+                    settings: settings.cloned(),
+                    executable,
+                })
+            } else {
+                None
+            };
+            Ok(PreparedRails {
+                decision,
+                modern_ticket,
+            })
         })
         .await
     }
@@ -618,27 +705,40 @@ impl RuntimeControls {
     ) -> anyhow::Result<()> {
         self.guard_own_pending(self.recover_unguarded(explicit_restore, recover_frequencies))
             .await
+            .map(|_| ())
     }
 
     async fn recover_unguarded(
         &self,
         explicit_restore: bool,
         recover_frequencies: impl FnOnce(bool) -> anyhow::Result<()>,
-    ) -> anyhow::Result<()> {
-        let unknown = explicit_restore && self.has_unknown_profile_transaction().await?;
+    ) -> anyhow::Result<NvidiaRuntimeInfo> {
+        if !explicit_restore {
+            // Local frequency compensation must not depend on helper availability.
+            recover_frequencies(false)?;
+            return self.recover_pending_inner(false, None).await;
+        }
+        let info = self.recovery_status().await?;
+        let unknown = self.unknown_profile_transaction(&info).await?;
         recover_frequencies(unknown)?;
-        self.recover_pending_inner(explicit_restore).await
+        self.recover_pending_inner(true, Some(info)).await
     }
 
     /// Resolve a previous interrupted profile before touching boost or clocks.
     /// An unknown checkpoint requires an explicit request to release rail controls.
     pub(super) async fn recover_pending(&self, explicit_restore: bool) -> anyhow::Result<()> {
-        self.guard_own_pending(self.recover_pending_inner(explicit_restore))
+        self.guard_own_pending(self.recover_pending_inner(explicit_restore, None))
             .await
+            .map(|_| ())
     }
 
-    async fn recover_pending_inner(&self, explicit_restore: bool) -> anyhow::Result<()> {
+    async fn recover_pending_inner(
+        &self,
+        explicit_restore: bool,
+        mut observed: Option<NvidiaRuntimeInfo>,
+    ) -> anyhow::Result<NvidiaRuntimeInfo> {
         let mut pending = self.pending.lock().await.clone();
+        let mut recovered = false;
         if let Some(transaction) = pending.as_mut()
             && let TransactionKind::Profile {
                 transaction_id,
@@ -646,7 +746,10 @@ impl RuntimeControls {
             } = &mut transaction.kind
             && transaction_id.is_none()
         {
-            let info = self.invoke(Action::Status, None).await?;
+            let info = match observed.take() {
+                Some(info) => info,
+                None => self.invoke(Action::Status, None).await?,
+            };
             if info.request_id.as_deref() == Some(request_id.as_str()) {
                 let id = info
                     .transaction_id
@@ -657,11 +760,15 @@ impl RuntimeControls {
             } else if info.transaction_id.is_none() {
                 self.clear_pending(transaction).await;
                 pending = None;
+                observed = Some(info);
             } else {
                 bail!("A different NVIDIA profile transaction requires recovery");
             }
         }
         if let Some(transaction) = pending {
+            // After any receipt recovery, refresh instead of retaining a pre-write snapshot.
+            observed = None;
+            recovered = true;
             let receipt = self.transaction_status(&transaction).await?;
             if matches!(
                 receipt.transaction_status.as_deref(),
@@ -672,7 +779,11 @@ impl RuntimeControls {
                 self.rollback(&transaction).await?;
             }
         }
-        let info = self.invoke(Action::Status, None).await?;
+        let mut info = match observed {
+            Some(info) => info,
+            None if recovered => self.status_after_recovery().await?,
+            None => self.recovery_status().await?,
+        };
         if profile_pending(&info) {
             ensure!(
                 explicit_restore,
@@ -680,10 +791,12 @@ impl RuntimeControls {
             );
             let id = info
                 .transaction_id
+                .clone()
                 .context("Missing profile recovery receipt")?;
             validate_token(&id)?;
             let request_id = info
                 .request_id
+                .clone()
                 .context("Missing profile recovery request identity")?;
             validate_token(&request_id)?;
             let transaction = RuntimeTransaction {
@@ -697,6 +810,7 @@ impl RuntimeControls {
             self.rollback(&transaction)
                 .await
                 .map_err(recovery_reported)?;
+            info = self.status_after_recovery().await?;
         } else if reports_recovery(&info) {
             ensure!(
                 explicit_restore,
@@ -704,17 +818,70 @@ impl RuntimeControls {
             );
             async {
                 self.apply(None).await?;
-                let restored = self.invoke(Action::Status, None).await?;
+                let restored = self.status_after_recovery().await?;
                 ensure!(
                     !restored.recovery_required && !restored.managed,
                     "NVIDIA runtime recovery remains pending"
                 );
-                anyhow::Ok(())
+                anyhow::Ok(restored)
             }
             .await
-            .map_err(recovery_reported)?;
+            .map_err(recovery_reported)
+            .map(|restored| info = restored)?;
         }
-        Ok(())
+        Ok(info)
+    }
+
+    /// Negotiated recovery metadata carries no policy values or permissions.
+    /// Every Apply still probes its complete rail bundle, and every recovery
+    /// mutation is followed by a full Status rather than this inexpensive path.
+    async fn recovery_status(&self) -> anyhow::Result<NvidiaRuntimeInfo> {
+        let identity = ExecutableIdentity::read(&self.config.executable).map_err(unavailable)?;
+        let negotiated = self.metadata_hint.lock().await.as_ref() == Some(&identity);
+        if negotiated
+            && self.pending.lock().await.is_none()
+            && !self.guard.recovery_outstanding.load(Ordering::SeqCst)
+            && !self.guard.unreaped.load(Ordering::SeqCst)
+        {
+            let metadata = self.invoke(Action::Metadata, None).await;
+            if let Ok(info) = &metadata
+                && info.capabilities.metadata_status == 1
+                && info.capabilities.rail_probe == 1
+            {
+                return metadata;
+            }
+            *self.metadata_hint.lock().await = None;
+            // Metadata is read-only. Retry only with a real full Status, once.
+            // A typed refusal cannot be turned into an outage by a failed retry.
+            let refused = metadata.as_ref().err().is_some_and(|error| {
+                error
+                    .chain()
+                    .any(|cause| cause.is::<HelperRefused>() || cause.is::<RecoveryReported>())
+            });
+            return match self.invoke(Action::Status, None).await {
+                Ok(info) => Ok(info),
+                Err(error) if refused => Err(HelperRefused(anyhow!(
+                    "NVIDIA metadata was refused and a full Status could not verify recovery: {error:#}"
+                )).into()),
+                Err(error) => Err(error),
+            };
+        }
+        *self.metadata_hint.lock().await = None;
+        self.invoke(Action::Status, None).await
+    }
+
+    /// A terminal receipt is not a fresh observation of all helper ownership.
+    /// Preserve the recovery guard through failure/cancellation of this refresh.
+    async fn status_after_recovery(&self) -> anyhow::Result<NvidiaRuntimeInfo> {
+        // Replies from older calls must finish before this guard is rearmed.
+        let lock = self.guard.lock.lock().await;
+        self.guard
+            .recovery_outstanding
+            .store(true, Ordering::SeqCst);
+        drop(lock);
+        self.invoke(Action::Status, None)
+            .await
+            .map_err(recovery_reported)
     }
 
     async fn preflight_rails(
@@ -722,16 +889,71 @@ impl RuntimeControls {
         settings: Option<&NvidiaRailControls>,
     ) -> anyhow::Result<RailPreparation> {
         let info = self.invoke(Action::Status, None).await?;
+        self.preflight_from_info(settings, info)
+            .await
+            .map(|(decision, _)| decision)
+    }
+
+    async fn preflight_from_info(
+        &self,
+        settings: Option<&NvidiaRailControls>,
+        info: NvidiaRuntimeInfo,
+    ) -> anyhow::Result<(RailPreparation, NvidiaRuntimeInfo)> {
         ensure!(
             !reports_recovery(&info),
             "NVIDIA recovery must finish before probing rail settings"
         );
         if info.capabilities.rail_probe == 1 {
             let probe = self.invoke(Action::Probe, settings).await?;
-            probe_preparation(&probe)
+            Ok((probe_preparation(&probe)?, probe))
         } else {
-            Ok(legacy_preparation(&info, settings))
+            Ok((legacy_preparation(&info, settings), info))
         }
+    }
+
+    pub(super) async fn stage_prepared(
+        &self,
+        settings: Option<&NvidiaRailControls>,
+        prepared: PreparedRails,
+    ) -> anyhow::Result<RuntimeTransaction> {
+        self.guard_own_pending(async {
+            ensure!(
+                self.pending.lock().await.is_none(),
+                "A previous NVIDIA profile transaction still needs recovery"
+            );
+            ensure!(
+                !self.guard.recovery_outstanding.load(Ordering::SeqCst)
+                    && !self.guard.unreaped.load(Ordering::SeqCst),
+                "NVIDIA recovery appeared after rail preparation"
+            );
+            if let Err(error) = self.validate(settings) {
+                if is_unavailable(&error) {
+                    return Ok(RuntimeTransaction {
+                        device: self.device.clone(),
+                        kind: TransactionKind::Deferred(deferred_reason(&error, settings)),
+                    });
+                }
+                return Err(error);
+            }
+            if let RailPreparation::Deferred(reason) = prepared.decision {
+                return Ok(RuntimeTransaction {
+                    device: self.device.clone(),
+                    kind: TransactionKind::Deferred(reason),
+                });
+            }
+            if let Some(ticket) = prepared.modern_ticket
+                && Arc::ptr_eq(&ticket.owner, &self.preparation_owner)
+                && ticket.device == self.device
+                && ticket.settings.as_ref() == settings
+                && ExecutableIdentity::read(&self.config.executable)
+                    .is_ok_and(|identity| identity == ticket.executable)
+            {
+                // Stage itself re-probes the complete bundle before creating a checkpoint.
+                return self.stage_modern(settings).await;
+            }
+            self.stage(settings).await
+        })
+        .await
     }
 
     pub(super) async fn stage(
@@ -807,6 +1029,13 @@ impl RuntimeControls {
             info.transaction_id.is_none(),
             "An unfinished NVIDIA profile transaction needs recovery"
         );
+        self.stage_modern(settings).await
+    }
+
+    async fn stage_modern(
+        &self,
+        settings: Option<&NvidiaRailControls>,
+    ) -> anyhow::Result<RuntimeTransaction> {
         let request_id = new_request_id()?;
         let pending = RuntimeTransaction {
             device: self.device.clone(),
@@ -820,6 +1049,10 @@ impl RuntimeControls {
             let info = self
                 .invoke_with_ids(Action::Stage, settings, None, Some(&request_id))
                 .await?;
+            ensure!(
+                info.capabilities.profile_transactions == 1,
+                "NVIDIA stage lost its profile transaction capability"
+            );
             ensure!(
                 info.request_id.as_deref() == Some(request_id.as_str()),
                 "NVIDIA stage returned a different request identity"
@@ -1016,6 +1249,11 @@ impl RuntimeControls {
         request_id: Option<&str>,
     ) -> anyhow::Result<NvidiaRuntimeInfo> {
         self.validate(settings)?;
+        let metadata_identity = if matches!(action, Action::Status) {
+            ExecutableIdentity::read(&self.config.executable).ok()
+        } else {
+            None
+        };
         for token in [transaction_id, request_id].into_iter().flatten() {
             validate_token(token)?;
         }
@@ -1060,9 +1298,24 @@ impl RuntimeControls {
             }
             let _ = tx.send(result);
         });
-        rx.await
+        let result = rx
+            .await
             .context("NVIDIA runtime helper task was interrupted")
-            .and_then(|result| result)
+            .and_then(|result| result);
+        if matches!(action, Action::Status) {
+            let still_same = metadata_identity.as_ref().is_some_and(|identity| {
+                ExecutableIdentity::read(&self.config.executable).is_ok_and(|now| now == *identity)
+            });
+            let supported = result.as_ref().is_ok_and(|info| {
+                info.capabilities.metadata_status == 1 && info.capabilities.rail_probe == 1
+            });
+            *self.metadata_hint.lock().await = if still_same && supported {
+                metadata_identity
+            } else {
+                None
+            };
+        }
+        result
     }
 }
 
@@ -1869,7 +2122,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let RailPreparation::Deferred(reason) = decision else {
+        let RailPreparation::Deferred(reason) = decision.decision else {
             panic!("expected rail deferral");
         };
         assert!(reason.ownership_unavailable);
@@ -2012,7 +2265,8 @@ mod tests {
                     Ok(())
                 })
                 .await
-                .unwrap(),
+                .unwrap()
+                .decision,
             RailPreparation::Deferred(_)
         ));
         let transaction = runtime.stage(None).await.unwrap();
@@ -2027,6 +2281,36 @@ mod tests {
                 .lines()
                 .all(|action| matches!(action, "status" | "probe"))
         );
+    }
+
+    #[tokio::test]
+    async fn post_recovery_refresh_waits_for_old_status_before_rearming_missing_executable() {
+        let body = format!(
+            "import socket\ns=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)\ns.connect(os.path.join(state_dir,'gate'))\ns.sendall(b'x')\nassert s.recv(1)==b'x'\ns.close()\nprint({RESPONSE:?})"
+        );
+        let (dir, runtime) = fake(&body, 5000);
+        let listener = tokio::net::UnixListener::bind(dir.path().join("gate")).unwrap();
+        let mut older = Box::pin(runtime.status());
+        assert!(futures::poll!(older.as_mut()).is_pending());
+        let (mut gate, _) = listener.accept().await.unwrap();
+        assert_eq!(gate.read_u8().await.unwrap(), b'x');
+        fs::rename(
+            &runtime.config.executable,
+            dir.path().join("removed-helper"),
+        )
+        .unwrap();
+        let mut refresh = Box::pin(runtime.status_after_recovery());
+        // The old call owns the GPU lock. Without serialized rearming, refresh
+        // would fail immediately and its guard would be overwritten by that call.
+        assert!(futures::poll!(refresh.as_mut()).is_pending());
+        gate.write_u8(b'x').await.unwrap();
+        assert!(older.await.available);
+        let error = refresh.await.unwrap_err();
+        assert!(!is_unavailable(&error), "{error:#}");
+        assert!(runtime.guard.recovery_outstanding.load(Ordering::SeqCst));
+        assert!(!is_unavailable(
+            &runtime.prepare_apply(None, |_| Ok(())).await.unwrap_err()
+        ));
     }
 }
 
