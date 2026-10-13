@@ -3,7 +3,8 @@ use super::profiles::profile_rule_window::{
 };
 use lact_client::ConnectionStatusMsg;
 use lact_schema::{
-    DeviceStats, ProfileRule, ProfilesInfo, config::ProfileHooks, request::ProfileBase,
+    DeviceApiInfo, DeviceStats, ProfileRule, ProfilesInfo, config::ProfileHooks,
+    request::ProfileBase,
 };
 use std::sync::Arc;
 
@@ -14,7 +15,15 @@ pub enum AppMsg {
     ReloadData {
         full: bool,
     },
-    ReloadApiInfo,
+    ReloadApiInfo {
+        gpu_id: String,
+        generation: u64,
+    },
+    ApiInfoLoaded {
+        gpu_id: String,
+        generation: u64,
+        result: Result<DeviceApiInfo, Arc<anyhow::Error>>,
+    },
     RefreshNvidiaRuntime,
     Stats(Arc<DeviceStats>),
     ProfilesPolled(Arc<ProfilesInfo>),

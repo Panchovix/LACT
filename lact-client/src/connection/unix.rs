@@ -44,6 +44,13 @@ impl DaemonConnection for UnixConnection {
         Box::pin(async { request(&mut self.inner, payload, &mut self.in_flight).await })
     }
 
+    fn supports_independent_connection(&self) -> bool {
+        self.inner
+            .get_ref()
+            .peer_addr()
+            .map_or(true, |address| address.as_pathname().is_some())
+    }
+
     fn new_connection(&self) -> BoxFuture<'_, anyhow::Result<Box<dyn DaemonConnection>>> {
         Box::pin(async {
             let peer_addr = self

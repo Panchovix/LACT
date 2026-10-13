@@ -8,6 +8,11 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 pub trait DaemonConnection {
     fn request<'a>(&'a mut self, payload: &'a str) -> BoxFuture<'a, anyhow::Result<String>>;
 
+    /// Whether this endpoint can open an independent connection.
+    fn supports_independent_connection(&self) -> bool {
+        true
+    }
+
     /// Establish a new connection to the same service
     fn new_connection(&self) -> BoxFuture<'_, anyhow::Result<Box<dyn DaemonConnection>>>;
 }
