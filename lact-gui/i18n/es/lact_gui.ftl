@@ -307,3 +307,5 @@ nvidia-rails-sensed = Voltaje sensado (driver): { $value } mV
 nvidia-rails-adc = Voltaje ADC: { $value } mV
 nvidia-rails-current = Lectura de corriente del raíl: { $value } A
 nvidia-rails-arbitrated-ocp = Límite OCP efectivo: { $value } A
+
+nvidia-rails-pending = Las solicitudes de raíles guardadas siguen pendientes; no se aplicó el conjunto de raíles. Los ajustes de clocks, VRAM, potencia y ventiladores pueden aplicarse. Motivo de la última omisión: { $reason }

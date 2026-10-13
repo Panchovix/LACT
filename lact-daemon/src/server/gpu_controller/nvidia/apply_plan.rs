@@ -86,11 +86,10 @@ impl Group {
         Self::Thermal,
     ];
 
-    /// Applied first: their writes do not depend on rail policies, so a later
-    /// rail or clock failure cannot leave them unapplied.
+    /// Applied first so a later rail or clock failure cannot leave them unapplied.
     const INDEPENDENT: [Self; 4] = [Self::PowerCap, Self::PowerMizer, Self::Fans, Self::Thermal];
 
-    /// Rail policies settle before new boost and clock settings, in this order.
+    /// Normal order after clock reset. Skipping Rails never skips Boost or Clocks.
     pub(super) const VOLTAGE_COUPLED: [Self; 3] = [Self::Boost, Self::Rails, Self::Clocks];
 
     fn bit(self) -> u8 {
@@ -152,9 +151,6 @@ impl ApplyPlan {
 #[derive(Default)]
 pub(super) struct AppliedState {
     last_successful: Option<GpuConfig>,
-    /// The latest configuration whose voltage-coupled groups wait for the
-    /// helper, or the one an edit replaces when nothing was applied yet.
-    pending_voltage: Option<GpuConfig>,
     uncertain: u8,
 }
 
@@ -191,7 +187,6 @@ impl AppliedState {
 
     pub(super) fn complete(&mut self, config: &GpuConfig) {
         self.last_successful = Some(config.clone());
-        self.pending_voltage = None;
         self.uncertain = 0;
     }
 
@@ -201,63 +196,43 @@ impl AppliedState {
 
     pub(super) fn invalidate_all(&mut self) {
         self.last_successful = None;
-        self.pending_voltage = None;
         self.uncertain = 0;
     }
 
-    /// With nothing applied or waiting yet, an edit is compared with the
-    /// configuration it replaces, so new boost, rail or clock settings in it
-    /// count as a change instead of becoming the reference.
-    pub(super) fn note_previous(&mut self, previous: &GpuConfig) {
-        if self.last_successful.is_none() && self.pending_voltage.is_none() {
-            self.pending_voltage = Some(previous.clone());
-        }
+    /// Only groups that actually succeeded update the cached baseline. Deferred
+    /// rails preserve their last applied intent and are retried independently.
+    pub(super) fn rails_pending(&self) -> bool {
+        self.uncertain & Group::Rails.bit() != 0
     }
 
-    /// Starts an Apply without a usable helper: the independent groups to write
-    /// now are marked attempted, and boost, rails and clocks are left pending.
-    pub(super) fn begin_without_helper(&mut self, desired: &GpuConfig) -> DegradedApply {
-        let groups = self.plan(desired).independent_groups();
-        let new_voltage_request = self.defer_voltage_groups(desired);
-        for group in &groups {
-            self.attempted(*group);
+    pub(super) fn rails_released(&mut self) {
+        if let Some(applied) = &mut self.last_successful {
+            applied.nvidia_rail_controls = None;
         }
-        DegradedApply {
-            groups,
-            new_voltage_request,
-        }
+        self.uncertain &= !Group::Rails.bit();
     }
 
-    /// Returns whether `desired` asks for boost, rail or clock settings other
-    /// than the ones applied or already waiting, which cannot take effect yet.
-    /// Only settings that may take effect later replace the waiting ones, so
-    /// reverting a rejected request compares against what was there before it.
-    fn defer_voltage_groups(&mut self, desired: &GpuConfig) -> bool {
-        let baseline = self
-            .pending_voltage
-            .as_ref()
-            .or(self.last_successful.as_ref());
-        let changed = baseline.is_some_and(|baseline| {
-            Group::VOLTAGE_COUPLED
-                .into_iter()
-                .any(|group| !equal(group, baseline, desired))
-        });
-        for group in Group::VOLTAGE_COUPLED {
-            self.uncertain |= group.bit();
+    pub(super) fn complete_with_deferred(&mut self, desired: &GpuConfig, deferred: &[Group]) {
+        let previous = self.last_successful.clone().unwrap_or_default();
+        let mut applied = desired.clone();
+        for group in deferred {
+            match group {
+                Group::Rails => {
+                    applied.nvidia_rail_controls = previous.nvidia_rail_controls.clone()
+                }
+                Group::Boost => {
+                    applied.clocks_configuration.voltage_boost =
+                        previous.clocks_configuration.voltage_boost
+                }
+                Group::Thermal => applied.nvidia_thermal_options = previous.nvidia_thermal_options,
+                _ => (),
+            }
         }
-        // With nothing known, as when startup or a profile switch applies an
-        // existing configuration, that configuration is the best reference for
-        // later changes. Edits note the configuration they replace first.
-        if !changed {
-            self.pending_voltage = Some(desired.clone());
+        self.complete(&applied);
+        for group in deferred {
+            self.invalidate(*group);
         }
-        changed
     }
-}
-
-pub(super) struct DegradedApply {
-    pub(super) groups: Vec<Group>,
-    pub(super) new_voltage_request: bool,
 }
 
 fn equal(group: Group, previous: &GpuConfig, desired: &GpuConfig) -> bool {
@@ -500,84 +475,56 @@ mod tests {
     }
 
     #[test]
-    fn unusable_helper_applies_independent_groups_and_keeps_voltage_groups_pending() {
-        let original = configured();
+    fn unsupported_rails_cache_clocks_vram_and_power_and_retry_only_rails() {
         let mut state = AppliedState::default();
-        state.complete(&original);
-        let mut desired = original.clone();
+        let mut desired = configured();
         desired.power_cap = Some(230.0);
-        // The daemon applies only these while the helper cannot run.
-        let degraded = state.begin_without_helper(&desired);
-        assert_eq!(degraded.groups, [Group::PowerCap]);
-        assert!(!degraded.new_voltage_request);
-        // Unchanged voltage settings are still applied once the helper works.
+        desired
+            .clocks_configuration
+            .gpu_clock_offsets
+            .insert(0, 100);
+        desired
+            .clocks_configuration
+            .mem_clock_offsets
+            .insert(0, 200);
+        desired.clocks_configuration.voltage_boost = Some(25);
+        state.complete_with_deferred(&desired, &[Group::Rails]);
+        assert_eq!(groups(state.plan(&desired)), [Group::Rails]);
         assert_eq!(
-            state.plan(&desired).steps(),
-            [
-                Step::Apply(Group::PowerCap),
-                Step::ResetClocks,
-                Step::Apply(Group::Boost),
-                Step::Apply(Group::Rails),
-                Step::Apply(Group::Clocks),
-            ]
+            state.last_successful.as_ref().unwrap().clocks_configuration,
+            desired.clocks_configuration
         );
+        assert_eq!(
+            state.last_successful.as_ref().unwrap().nvidia_rail_controls,
+            None
+        );
+        // A later clock edit is still applied, even with saved rail intent pending.
+        desired
+            .clocks_configuration
+            .mem_clock_offsets
+            .insert(0, 250);
+        assert!(state.plan(&desired).includes(Group::Clocks));
+        state.complete_with_deferred(&desired, &[Group::Rails]);
+        assert_eq!(groups(state.plan(&desired)), [Group::Rails]);
+        // Once the helper succeeds, repeating the same request is a no-op.
         state.complete(&desired);
         assert!(groups(state.plan(&desired)).is_empty());
     }
 
     #[test]
-    fn degraded_applies_tell_new_voltage_requests_from_ones_already_waiting() {
+    fn skipped_bundle_preserves_last_applied_rails_and_deferred_release() {
         let original = configured();
         let mut state = AppliedState::default();
-        let mut new_request = |config: &GpuConfig| {
-            let degraded = state.begin_without_helper(config);
-            degraded.new_voltage_request
-        };
-        // Startup with a broken helper: the configuration becomes the reference.
-        assert!(!new_request(&original));
-        let mut power = original.clone();
-        power.power_cap = Some(230.0);
-        assert!(!new_request(&power));
-        let mut clocks = power.clone();
-        clocks.clocks_configuration.mem_clock_offsets.insert(0, 100);
-        assert!(new_request(&clocks));
-        // Reverting the rejected change finds the earlier reference intact.
-        assert!(!new_request(&power));
-        let mut rails = power.clone();
-        rails.nvidia_rail_controls = None;
-        assert!(new_request(&rails));
-        assert!(!new_request(&power));
-        // A complete Apply makes the applied settings the reference.
         state.complete(&original);
-        let mut new_request = |config: &GpuConfig| {
-            let degraded = state.begin_without_helper(config);
-            degraded.new_voltage_request
-        };
-        assert!(!new_request(&power));
-        assert!(new_request(&clocks));
-        state.invalidate_all();
-        assert!(!state.begin_without_helper(&clocks).new_voltage_request);
-    }
-
-    #[test]
-    fn an_edit_is_compared_with_the_configuration_it_replaces() {
-        let mut state = AppliedState::default();
-        // The first edit of a GPU without saved settings, during an outage.
-        state.note_previous(&GpuConfig::default());
-        let power = GpuConfig {
-            power_cap: Some(230.0),
-            ..Default::default()
-        };
-        let mut rails = power.clone();
-        rails.nvidia_rail_controls = configured().nvidia_rail_controls;
-        let mut clocks = power.clone();
-        clocks.clocks_configuration.mem_clock_offsets.insert(0, 100);
-        assert!(state.begin_without_helper(&rails).new_voltage_request);
-        assert!(state.begin_without_helper(&clocks).new_voltage_request);
-        assert!(!state.begin_without_helper(&power).new_voltage_request);
-        // A note never replaces a reference that is already known.
-        state.note_previous(&configured());
-        assert!(state.begin_without_helper(&rails).new_voltage_request);
+        let mut desired = original.clone();
+        desired.nvidia_rail_controls = None;
+        desired.power_cap = Some(230.0);
+        state.complete_with_deferred(&desired, &[Group::Rails]);
+        assert_eq!(
+            state.last_successful.as_ref().unwrap().nvidia_rail_controls,
+            original.nvidia_rail_controls
+        );
+        assert_eq!(groups(state.plan(&desired)), [Group::Rails]);
     }
 
     #[test]

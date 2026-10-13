@@ -42,6 +42,15 @@ pub struct NvidiaRuntimeInfo {
     pub transaction_status: Option<String>,
     pub request_id: Option<String>,
     pub telemetry: Option<NvidiaRuntimeTelemetry>,
+    /// GET-only probe decision for the complete settings/ownership bundle.
+    pub can_stage: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deferred_fields: Vec<NvidiaDeferredRailField>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub ownership_unavailable: bool,
+    /// LACT has saved rail intent that has not been applied or released yet.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub rails_pending: bool,
 }
 
 #[skip_serializing_none]
@@ -86,12 +95,43 @@ pub struct NvidiaAltVopIdentity {
 pub struct NvidiaRuntimeCapabilities {
     #[serde(default)]
     pub profile_transactions: u32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub rail_probe: u32,
 }
 
 impl NvidiaRuntimeCapabilities {
     pub fn is_empty(&self) -> bool {
-        self.profile_transactions == 0
+        self.profile_transactions == 0 && self.rail_probe == 0
     }
+}
+
+/// A field the provider cannot currently set or restore; no bundle SET is made.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NvidiaDeferredRailField {
+    pub rail: NvidiaRail,
+    pub field: NvidiaRailField,
+    pub operation: NvidiaRailOperation,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NvidiaRailField {
+    MinVoltageUv,
+    MaxVoltageUv,
+    OvervoltageUv,
+    OcpLimitMa,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NvidiaRailOperation {
+    Set,
+    Restore,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 fn is_false(value: &bool) -> bool {
@@ -133,7 +173,7 @@ pub struct NvidiaTelemetryUnavailable {
     pub reason: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum NvidiaRail {
     #[serde(rename = "NVVDD")]
     Nvvdd,
@@ -254,5 +294,22 @@ mod tests {
         let invalid = serde_json::json!({"rail":"NVVDD","alt_vop":{"selector_present":true,
             "selector":65536,"writable":false,"identity":identity(0, 1)}});
         assert!(serde_json::from_value::<NvidiaRuntimeRail>(invalid).is_err());
+    }
+
+    #[test]
+    fn deferred_rail_probe_is_typed_and_backwards_compatible() {
+        let mut wire = serde_json::json!({"protocol_version":1,"available":false,
+            "device":{"uuid":"GPU-test","bdf":"0000:09:00.0"},"managed":true,"rails":[],
+            "capabilities":{"rail_probe":1},"can_stage":false,"ownership_unavailable":true,
+            "deferred_fields":[{"rail":"MSVDD","field":"max_voltage_uv","operation":"restore","reason":"driver has no reviewed rail control"}]});
+        let info: NvidiaRuntimeInfo = serde_json::from_value(wire.clone()).unwrap();
+        assert!(!info.recovery_required);
+        assert_eq!(
+            info.deferred_fields[0].operation,
+            NvidiaRailOperation::Restore
+        );
+        assert_eq!(info.capabilities.rail_probe, 1);
+        wire["deferred_fields"][0]["field"] = "arbitrary_native_field".into();
+        assert!(serde_json::from_value::<NvidiaRuntimeInfo>(wire).is_err());
     }
 }

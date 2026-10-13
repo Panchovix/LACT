@@ -21,17 +21,18 @@ fn actions(dir: &tempfile::TempDir) -> Vec<String> {
 
 #[tokio::test]
 async fn legacy_provider_defers_application_until_commit() {
+    let supported = RESPONSE.replace("\"rails\":[]", "\"rails\":[{\"rail\":\"NVVDD\",\"max_voltage\":{\"evaluated_uv\":950000,\"offset_uv\":0,\"writable\":true}}]");
     let body = format!(
-        "with open(os.path.join(state_dir,'calls'),'a') as f: f.write(r['action']+'\\n')\nprint({RESPONSE:?})"
+        "with open(os.path.join(state_dir,'calls'),'a') as f: f.write(r['action']+'\\n')\nprint({supported:?})"
     );
     let (dir, runtime) = fake(&body, 2000);
     let transaction = runtime.stage(Some(&requested())).await.unwrap();
     assert!(!transaction.is_staged());
-    assert_eq!(actions(&dir), ["status"]);
+    assert_eq!(actions(&dir), ["status", "status"]);
     runtime.rollback(&transaction).await.unwrap();
-    assert_eq!(actions(&dir), ["status"]);
+    assert_eq!(actions(&dir), ["status", "status"]);
     runtime.commit(&transaction).await.unwrap();
-    assert_eq!(actions(&dir), ["status", "apply"]);
+    assert_eq!(actions(&dir), ["status", "status", "apply"]);
 }
 
 #[tokio::test]

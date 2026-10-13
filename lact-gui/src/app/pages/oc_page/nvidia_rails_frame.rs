@@ -33,7 +33,7 @@ struct RailRow {
 pub enum NvidiaRailsFrameMsg {
     Info {
         is_nvidia: bool,
-        info: Option<NvidiaRuntimeInfo>,
+        info: Option<Box<NvidiaRuntimeInfo>>,
     },
     Config(Option<NvidiaRailControls>),
     Enabled(bool),
@@ -73,6 +73,13 @@ impl relm4::Component for NvidiaRailsFrame {
                         set_wrap: true,
                         set_xalign: 0.0,
                         set_max_width_chars: 60,
+                    },
+                    #[name = "pending_warning"]
+                    gtk::Label {
+                        set_wrap: true,
+                        set_xalign: 0.0,
+                        set_max_width_chars: 60,
+                        add_css_class: relm4::css::WARNING,
                     },
                     gtk::Label {
                         set_label: &fl!(I18N, "nvidia-rails-policy-note"),
@@ -242,7 +249,7 @@ impl relm4::Component for NvidiaRailsFrame {
         match msg {
             NvidiaRailsFrameMsg::Info { is_nvidia, info } => {
                 self.is_nvidia = is_nvidia;
-                self.info = info;
+                self.info = info.map(|info| *info);
             }
             NvidiaRailsFrameMsg::Config(config) => {
                 self.configured = config;
@@ -297,6 +304,9 @@ impl relm4::Component for NvidiaRailsFrame {
                         .unwrap_or_else(|| fl!(I18N, "nvidia-rails-unavailable"))
                 }),
         );
+        let pending = self.pending_message();
+        widgets.pending_warning.set_label(&pending);
+        widgets.pending_warning.set_visible(!pending.is_empty());
         for (index, row) in self.rows.iter().enumerate() {
             row.entry.set_sensitive(self.editable(index));
             let available = self.field_supported(index);
@@ -381,6 +391,53 @@ impl relm4::Component for NvidiaRailsFrame {
 }
 
 impl NvidiaRailsFrame {
+    fn pending_message(&self) -> String {
+        let info = self.info.as_ref();
+        if info.is_some_and(|info| info.recovery_required) {
+            return String::new();
+        }
+        let saved = self
+            .configured
+            .as_ref()
+            .is_some_and(|settings| (0..8).any(|index| field_value(settings, index).is_some()));
+        let pending = info.is_some_and(|info| {
+            info.rails_pending
+                || !info.deferred_fields.is_empty()
+                || (saved && info.can_stage == Some(false))
+        }) || (saved && info.is_none());
+        if !pending {
+            return String::new();
+        }
+        let reason = info
+            .map(|info| {
+                if info.deferred_fields.is_empty() {
+                    info.reason
+                        .clone()
+                        .unwrap_or_else(|| fl!(I18N, "nvidia-rails-unavailable"))
+                } else {
+                    info.deferred_fields
+                        .iter()
+                        .map(|field| {
+                            let rail = match field.rail {
+                                NvidiaRail::Nvvdd => "NVVDD",
+                                NvidiaRail::Msvdd => "MSVDD",
+                            };
+                            let policy = match field.field {
+                                lact_schema::NvidiaRailField::MinVoltageUv => "VMIN",
+                                lact_schema::NvidiaRailField::MaxVoltageUv => "REL",
+                                lact_schema::NvidiaRailField::OvervoltageUv => "OV",
+                                lact_schema::NvidiaRailField::OcpLimitMa => "OCP",
+                            };
+                            format!("{rail} {policy}: {}", field.reason)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                }
+            })
+            .unwrap_or_else(|| fl!(I18N, "nvidia-rails-unavailable"));
+        fl!(I18N, "nvidia-rails-pending", reason = reason)
+    }
+
     fn telemetry_details(&self) -> String {
         let Some(telemetry) = self.info.as_ref().and_then(|info| info.telemetry.as_ref()) else {
             return String::new();
@@ -436,7 +493,7 @@ impl NvidiaRailsFrame {
             || self
                 .info
                 .as_ref()
-                .is_some_and(|info| info.managed || info.recovery_required)
+                .is_some_and(|info| info.managed || info.recovery_required || info.rails_pending)
             || self.edits.fields.iter().any(Option::is_some)
     }
 
@@ -463,22 +520,28 @@ impl NvidiaRailsFrame {
     }
 
     fn field_writable(&self, index: usize) -> bool {
-        self.info.as_ref().is_some_and(|info| info.available)
-            && self.rail(index).is_some_and(|rail| match index % 4 {
-                0 => rail
-                    .min_voltage
-                    .as_ref()
-                    .is_some_and(|policy| policy.writable),
-                1 => rail
-                    .max_voltage
-                    .as_ref()
-                    .is_some_and(|policy| policy.writable),
-                2 => rail
-                    .overvoltage
-                    .as_ref()
-                    .is_some_and(|policy| policy.writable),
-                _ => rail.ocp_limit.as_ref().is_some_and(|limit| limit.writable),
-            })
+        self.info.as_ref().is_some_and(|info| {
+            info.available
+                && !info.recovery_required
+                && !matches!(
+                    info.transaction_status.as_deref(),
+                    Some("prepared" | "staged" | "rollback_required")
+                )
+        }) && self.rail(index).is_some_and(|rail| match index % 4 {
+            0 => rail
+                .min_voltage
+                .as_ref()
+                .is_some_and(|policy| policy.writable),
+            1 => rail
+                .max_voltage
+                .as_ref()
+                .is_some_and(|policy| policy.writable),
+            2 => rail
+                .overvoltage
+                .as_ref()
+                .is_some_and(|policy| policy.writable),
+            _ => rail.ocp_limit.as_ref().is_some_and(|limit| limit.writable),
+        })
     }
 
     fn readback(&self, index: usize) -> String {

@@ -7,7 +7,7 @@ mode_path = Path(state_dir) / "mode"
 mode = mode_path.read_text().strip() if mode_path.exists() else ""
 with (Path(state_dir) / "calls").open("a") as out:
     out.write(r["action"] + "\n")
-base = {"protocol_version": 1, "available": True, "managed": False, "device": r["device"], "rails": [], "capabilities": {"profile_transactions": 1}, "recovery_required": False}
+base = {"protocol_version": 1, "available": True, "managed": False, "device": r["device"], "rails": [{"rail": "NVVDD", "max_voltage": {"evaluated_uv": 950000, "offset_uv": 0, "writable": True}}], "capabilities": {"profile_transactions": 1}, "recovery_required": False}
 def save():
     path.write_text(json.dumps(state))
 def emit(receipt=None, pending=False):

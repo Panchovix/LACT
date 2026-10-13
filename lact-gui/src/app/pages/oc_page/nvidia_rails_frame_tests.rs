@@ -154,6 +154,55 @@ fn alt_vop_reads_as_text_only_and_legacy_voltage_as_the_rail_reference() {
     );
 }
 
+#[test]
+fn pending_rail_warning_does_not_replace_current_readings_or_requested_edits() {
+    let info: NvidiaRuntimeInfo = serde_json::from_value(serde_json::json!({
+        "protocol_version":1,"available":true,"device":{"uuid":"GPU-test","bdf":"0000:09:00.0"},
+        "managed":false,"capabilities":{"rail_probe":1},"can_stage":false,"rails_pending":true,
+        "deferred_fields":[{"rail":"MSVDD","field":"max_voltage_uv","operation":"set","reason":"R625 no rail SET"}],
+        "rails":[{"rail":"NVVDD","max_voltage":{"evaluated_uv":1040000,"offset_uv":0,"writable":true}}]
+    })).unwrap();
+    let configured = NvidiaRailControls {
+        nvvdd: NvidiaRailSettings {
+            max_voltage_uv: Some(1125000),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut model = NvidiaRailsFrame {
+        info: Some(info),
+        is_nvidia: true,
+        configured: Some(configured),
+        edits: RailEdits::default(),
+        rows: vec![],
+        rail_sections: vec![],
+        protection_sections: vec![],
+        voltage_readbacks: vec![],
+        loading: Rc::new(Cell::new(false)),
+    };
+    model.edits.fields[1] = Some("1150".into());
+    assert!(model.pending_message().contains("R625 no rail SET"));
+    assert!(model.readback(1).contains("1040"));
+    assert_eq!(model.edits.fields[1].as_deref(), Some("1150"));
+    model.info.as_mut().unwrap().available = false;
+    model.info.as_mut().unwrap().rails[0]
+        .max_voltage
+        .as_mut()
+        .unwrap()
+        .writable = false;
+    assert!(model.field_supported(1));
+    assert!(model.readback(1).contains("1040"));
+    assert!(!model.field_writable(1));
+    assert_eq!(model.edits.fields[1].as_deref(), Some("1150"));
+    model.info.as_mut().unwrap().can_stage = Some(true);
+    assert!(!model.pending_message().is_empty());
+    model.configured = None;
+    assert!(model.can_restore());
+    model.info.as_mut().unwrap().recovery_required = true;
+    assert!(model.pending_message().is_empty());
+    assert!(!model.field_writable(1));
+}
+
 #[cfg(feature = "gtk-tests")]
 #[test]
 #[ignore = "requires a GTK display; run this exact test explicitly"]
@@ -194,9 +243,13 @@ fn rail_panel_load_is_not_an_edit_and_unsupported_fields_are_preserved() {
     assert_eq!(current.nvidia_rail_controls, Some(configured));
     frame.emit(NvidiaRailsFrameMsg::Info {
         is_nvidia: true,
-        info: Some(NvidiaRuntimeInfo {
+        info: Some(Box::new(NvidiaRuntimeInfo {
             protocol_version: 1,
             recovery_required: false,
+            can_stage: None,
+            deferred_fields: vec![],
+            ownership_unavailable: false,
+            rails_pending: false,
             capabilities: Default::default(),
             transaction_id: None,
             transaction_status: None,
@@ -243,7 +296,7 @@ fn rail_panel_load_is_not_an_edit_and_unsupported_fields_are_preserved() {
                 }),
                 alt_vop: Some(synthetic_alt_vop()),
             }],
-        }),
+        })),
     });
     drain();
     assert!(frame.model().rows[0].entry.is_sensitive());
@@ -278,12 +331,33 @@ fn rail_panel_load_is_not_an_edit_and_unsupported_fields_are_preserved() {
     );
     frame.model().rows[0].entry.set_text("925.125");
     drain();
+    let mut deferred_info = frame.model().info.clone().unwrap();
+    deferred_info.capabilities.rail_probe = 1;
+    deferred_info.can_stage = Some(false);
+    deferred_info.rails_pending = true;
+    deferred_info
+        .deferred_fields
+        .push(lact_schema::NvidiaDeferredRailField {
+            rail: NvidiaRail::Msvdd,
+            field: lact_schema::NvidiaRailField::OcpLimitMa,
+            operation: lact_schema::NvidiaRailOperation::Set,
+            reason: "synthetic R625 unsupported rail".into(),
+        });
     frame.emit(NvidiaRailsFrameMsg::Info {
         is_nvidia: true,
-        info: frame.model().info.clone(),
+        info: Some(Box::new(deferred_info)),
     });
     drain();
     assert_eq!(frame.model().rows[0].entry.text(), "925.125");
+    assert!(frame.widgets().pending_warning.get_visible());
+    assert!(
+        frame
+            .widgets()
+            .pending_warning
+            .text()
+            .contains("synthetic R625 unsupported rail")
+    );
+    assert!(frame.model().rows[0].readback.text().contains("900.125"));
     frame.model().apply_config(&mut current).unwrap();
     assert_eq!(
         current
@@ -322,7 +396,7 @@ fn rail_panel_load_is_not_an_edit_and_unsupported_fields_are_preserved() {
     // A pending helper transaction can be restored without reinterpreting protection opt-in.
     frame.emit(NvidiaRailsFrameMsg::Info {
         is_nvidia: true,
-        info: Some(NvidiaRuntimeInfo {
+        info: Some(Box::new(NvidiaRuntimeInfo {
             protocol_version: 1,
             recovery_required: true,
             capabilities: Default::default(),
@@ -330,6 +404,10 @@ fn rail_panel_load_is_not_an_edit_and_unsupported_fields_are_preserved() {
             transaction_status: None,
             request_id: None,
             telemetry: None,
+            can_stage: None,
+            deferred_fields: vec![],
+            ownership_unavailable: false,
+            rails_pending: false,
             available: false,
             reason: Some("Synthetic recovery required".to_owned()),
             device: lact_schema::NvidiaRuntimeDevice {
@@ -338,7 +416,7 @@ fn rail_panel_load_is_not_an_edit_and_unsupported_fields_are_preserved() {
             },
             managed: false,
             rails: Vec::new(),
-        }),
+        })),
     });
     frame.emit(NvidiaRailsFrameMsg::Config(None));
     drain();
