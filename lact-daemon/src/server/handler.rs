@@ -294,7 +294,11 @@ impl<'a> Handler {
     }
 
     pub async fn notify_reload_gpus(&self, accum_interval: Duration) {
-        self.reload_tx.send(accum_interval).await.unwrap();
+        // The device event and resume listeners call this and must survive a
+        // reload loop that ended.
+        if let Err(err) = self.reload_tx.send(accum_interval).await {
+            error!("GPU reload loop is not running, dropping reload request: {err}");
+        }
     }
 
     async fn reload_gpus(&self) {
@@ -3048,6 +3052,50 @@ mod runtime_config_reconciliation_tests {
                 }
             })
             .await;
+    }
+
+    /// A GPU that left the bus fails its reset; the GPUs after it are still
+    /// cleaned up, on reload as on shutdown, which then exits.
+    #[tokio::test]
+    async fn reload_and_shutdown_clean_up_the_gpus_after_a_lost_one() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let no_gpus = tempfile::tempdir().unwrap();
+                for reload in [true, false] {
+                    let (lost_log, ok_log) = (Rc::default(), Rc::default());
+                    let lost = FanLoopController::started(&lost_log, false, true);
+                    let ok = FanLoopController::started(&ok_log, false, false);
+                    let ticks = [lost.ticks.clone(), ok.ticks.clone()];
+                    let handler = handler_with(
+                        Config::default(),
+                        BTreeMap::from([
+                            ("0-lost".into(), Box::new(lost) as DynGpuController),
+                            ("1-ok".into(), Box::new(ok) as DynGpuController),
+                        ]),
+                    );
+                    if reload {
+                        handler.reload_gpus_from(no_gpus.path()).await;
+                        assert_eq!(*ok_log.borrow(), ["cleanup"]);
+                    } else {
+                        tokio::time::timeout(Duration::from_secs(10), handler.cleanup())
+                            .await
+                            .expect("shutdown cleanup must return to exit");
+                        assert_eq!(*ok_log.borrow(), ["apply", "cleanup"]);
+                    }
+                    assert_eq!(*lost_log.borrow(), ["release"]);
+                    for ticks in &ticks {
+                        assert_loop_stopped(ticks).await;
+                    }
+                }
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn reload_requests_survive_a_reload_loop_that_ended() {
+        // This handler's reload receiver is already gone.
+        let handler = handler_with(Config::default(), BTreeMap::new());
+        handler.notify_reload_gpus(Duration::ZERO).await;
     }
 
     #[tokio::test]
