@@ -288,106 +288,22 @@ impl NvidiaGpuController {
 
         let nvml = self.nvml.clone();
         let pci_slot_id = self.common.pci_slot_name.clone();
+        let interval_ms = settings.interval_ms;
         debug!("spawning new fan control task");
 
         let handle = tokio::task::spawn_local(async move {
-            let mut device = nvml
-                .device_by_pci_bus_id(pci_slot_id.as_str())
-                .expect("Can no longer get device");
-
-            let mut last_pwm = (None, Instant::now());
-            let mut last_temp = 0;
-
-            let interval = Duration::from_millis(settings.interval_ms);
-            let spindown_delay = Duration::from_millis(settings.spindown_delay_ms.unwrap_or(0));
-            #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
-            let change_threshold = settings.change_threshold.unwrap_or(0) as i32;
-            #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
-            let auto_threshold = settings.auto_threshold.unwrap_or(0) as i32;
-
-            let mut manual_mode = true;
-
-            loop {
-                select! {
-                    () = sleep(interval) => (),
-                    () = task_notify.notified() => break,
+            match lookup_device(&nvml, &pci_slot_id) {
+                Ok(mut device) => {
+                    run_fan_curve(&mut device, fan_count, &curve, &settings, &task_notify).await;
                 }
-
-                #[allow(clippy::cast_possible_wrap)]
-                let current_temp = device
-                    .temperature(TemperatureSensor::Gpu)
-                    .expect("Could not read temperature") as i32;
-
-                if (last_temp - current_temp).abs() < change_threshold {
-                    trace!(
-                        "temperature changed from {last_temp}°C to {current_temp}°C, which is less than the {change_threshold}°C threshold, skipping speed adjustment"
-                    );
-                    continue;
-                }
-
-                if current_temp < auto_threshold {
-                    if manual_mode {
-                        trace!("temperature below auto threshold, setting fan policy to auto");
-                        for fan in 0..fan_count {
-                            if let Err(err) = device.set_default_fan_speed(fan) {
-                                error!(
-                                    "could not set fan speed to auto: {err}, disabling fan control"
-                                );
-                                break;
-                            }
-                        }
-
-                        manual_mode = false;
-                    } else {
-                        trace!("temperature below auto threshold, skipping control");
-                    }
-                    continue;
-                }
-
-                let target_pwm = curve.pwm_at_temp(Temperature {
-                    #[allow(clippy::cast_precision_loss)]
-                    current: Some(current_temp as f32),
-                    crit: None,
-                    crit_hyst: None,
-                });
-                let now = Instant::now();
-
-                if let (Some(previous_pwm), previous_timestamp) = last_pwm {
-                    let diff = now - previous_timestamp;
-                    if target_pwm < previous_pwm && diff < spindown_delay {
-                        trace!(
-                            "delaying fan spindown ({}ms left)",
-                            spindown_delay.checked_sub(diff).unwrap().as_millis()
-                        );
-                        continue;
-                    }
-                }
-
-                last_pwm = (Some(target_pwm), now);
-                last_temp = current_temp;
-
-                trace!("fan control tick: setting pwm to {target_pwm}");
-
-                for fan in 0..fan_count {
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                    if let Err(err) =
-                        device.set_fan_speed(fan, (f64::from(target_pwm) / 2.55) as u32)
-                    {
-                        error!("could not set fan speed: {err}, disabling fan control");
-                        break;
-                    }
-                }
-                manual_mode = true;
+                Err(err) => error!("fan control was not started: {err:#}"),
             }
             debug!("exited fan control task");
         });
 
         *notify_guard = Some((notify, handle));
 
-        debug!(
-            "started fan control with interval {}ms",
-            settings.interval_ms
-        );
+        debug!("started fan control with interval {interval_ms}ms");
 
         Ok(())
     }
@@ -400,9 +316,11 @@ impl NvidiaGpuController {
             .try_borrow_mut()
             .map_err(|err| anyhow!("Lock error: {err}"))?
             .take();
+        // A failed task must still hand its fans back below.
+        let mut task_error = None;
         if let Some((notify, handle)) = maybe_notify {
             notify.notify_one();
-            handle.await?;
+            task_error = handle.await.err();
             fail_on_error = true;
         }
 
@@ -420,7 +338,19 @@ impl NvidiaGpuController {
             }
         }
 
-        Ok(())
+        match task_error {
+            Some(err) => Err(anyhow!(err).context("Fan control task failed")),
+            None => Ok(()),
+        }
+    }
+
+    /// Whether the curve fan control loop ended without being stopped, after
+    /// handing the fans back to the driver.
+    fn fan_curve_stopped_itself(&self) -> bool {
+        self.fan_control_handle.try_borrow().is_ok_and(|task| {
+            task.as_ref()
+                .is_some_and(|(_, handle)| handle.is_finished())
+        })
     }
 
     /// Stops the fan loop and hands every fan back to the driver without touching
@@ -968,6 +898,142 @@ fn average_fan_value<E>(
     }
 
     (count > 0).then(|| sum / count)
+}
+
+/// Consecutive unreadable temperatures after which a fan curve hands its fans
+/// back to the driver rather than hold a speed it can no longer adjust.
+const FAN_CURVE_MAX_READ_FAILURES: u32 = 3;
+
+/// The temperature and fans a curve fan control loop works with.
+trait FanDevice {
+    fn gpu_temperature(&self) -> Result<u32, NvmlError>;
+    fn set_fan_percent(&mut self, fan: u32, percent: u32) -> Result<(), NvmlError>;
+    fn release_fan(&mut self, fan: u32) -> Result<(), NvmlError>;
+}
+
+impl FanDevice for Device<'_> {
+    fn gpu_temperature(&self) -> Result<u32, NvmlError> {
+        self.temperature(TemperatureSensor::Gpu)
+    }
+
+    fn set_fan_percent(&mut self, fan: u32, percent: u32) -> Result<(), NvmlError> {
+        self.set_fan_speed(fan, percent)
+    }
+
+    fn release_fan(&mut self, fan: u32) -> Result<(), NvmlError> {
+        self.set_default_fan_speed(fan)
+    }
+}
+
+/// Drives the fans along `curve` until `stop` is notified. Temperature reads
+/// that keep failing hand the fans back to the driver and end the loop.
+async fn run_fan_curve(
+    device: &mut impl FanDevice,
+    fan_count: u32,
+    curve: &FanCurve,
+    settings: &FanControlSettings,
+    stop: &Notify,
+) {
+    let mut last_pwm = (None, Instant::now());
+    let mut last_temp = 0;
+
+    let interval = Duration::from_millis(settings.interval_ms);
+    let spindown_delay = Duration::from_millis(settings.spindown_delay_ms.unwrap_or(0));
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+    let change_threshold = settings.change_threshold.unwrap_or(0) as i32;
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+    let auto_threshold = settings.auto_threshold.unwrap_or(0) as i32;
+
+    let mut manual_mode = true;
+    let mut read_failures = 0;
+
+    loop {
+        select! {
+            () = sleep(interval) => (),
+            () = stop.notified() => break,
+        }
+
+        #[allow(clippy::cast_possible_wrap)]
+        let current_temp = match device.gpu_temperature() {
+            Ok(temp) => {
+                read_failures = 0;
+                temp as i32
+            }
+            Err(err) => {
+                read_failures += 1;
+                if read_failures < FAN_CURVE_MAX_READ_FAILURES {
+                    warn!("could not read temperature: {err}, keeping the current fan speed");
+                    continue;
+                }
+                error!(
+                    "could not read temperature {read_failures} times in a row: {err}, returning the fans to the driver"
+                );
+                for fan in 0..fan_count {
+                    if let Err(err) = device.release_fan(fan) {
+                        error!("could not return fan {fan} to the driver: {err}");
+                    }
+                }
+                break;
+            }
+        };
+
+        if (last_temp - current_temp).abs() < change_threshold {
+            trace!(
+                "temperature changed from {last_temp}°C to {current_temp}°C, which is less than the {change_threshold}°C threshold, skipping speed adjustment"
+            );
+            continue;
+        }
+
+        if current_temp < auto_threshold {
+            if manual_mode {
+                trace!("temperature below auto threshold, setting fan policy to auto");
+                for fan in 0..fan_count {
+                    if let Err(err) = device.release_fan(fan) {
+                        error!("could not set fan speed to auto: {err}, disabling fan control");
+                        break;
+                    }
+                }
+
+                manual_mode = false;
+            } else {
+                trace!("temperature below auto threshold, skipping control");
+            }
+            continue;
+        }
+
+        let target_pwm = curve.pwm_at_temp(Temperature {
+            #[allow(clippy::cast_precision_loss)]
+            current: Some(current_temp as f32),
+            crit: None,
+            crit_hyst: None,
+        });
+        let now = Instant::now();
+
+        if let (Some(previous_pwm), previous_timestamp) = last_pwm {
+            let diff = now - previous_timestamp;
+            if target_pwm < previous_pwm && diff < spindown_delay {
+                trace!(
+                    "delaying fan spindown ({}ms left)",
+                    spindown_delay.checked_sub(diff).unwrap().as_millis()
+                );
+                continue;
+            }
+        }
+
+        last_pwm = (Some(target_pwm), now);
+        last_temp = current_temp;
+
+        trace!("fan control tick: setting pwm to {target_pwm}");
+
+        for fan in 0..fan_count {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            if let Err(err) = device.set_fan_percent(fan, (f64::from(target_pwm) / 2.55) as u32) {
+                error!("could not set fan speed: {err}, disabling fan control");
+                break;
+            }
+        }
+        manual_mode = true;
+    }
 }
 
 /// The fan control settings part of a GPU's stats, without any readings.
@@ -2157,6 +2223,12 @@ impl GpuController for NvidiaGpuController {
             if rail_deferral.is_some() {
                 self.deferred_rails.replace(rail_deferral.clone());
             }
+            if self.fan_curve_stopped_itself() {
+                // It handed the fans back to the driver, so start it again.
+                self.applied_state
+                    .borrow_mut()
+                    .invalidate(apply_plan::Group::Fans);
+            }
             let plan = self.applied_state.borrow().plan(config);
             let mut transaction = None;
             // Groups that failed with a warning are retried by the next Apply.
@@ -2504,14 +2576,20 @@ mod tests {
     use super::{
         CLOCK_CLIENT_CLK_VF_POINT_TYPE_PROG, ClockClientClkVfPointInfoV1,
         ClockClientClkVfPointsControlV1, ClockClientClkVfPointsInfoV1,
-        ClockClientClkVfPointsStatusV3, NvmlError, PowerLimit, TargetTemperature,
+        ClockClientClkVfPointsStatusV3, FanDevice, NvmlError, PowerLimit, TargetTemperature,
         TemperatureThreshold, apply_power_cap, apply_target_temperature, build_curve_control,
-        build_vf_curve,
+        build_vf_curve, run_fan_curve,
     };
     use anyhow::Context;
     use indexmap::IndexMap;
-    use lact_schema::config::NvidiaCurvePoint;
-    use std::cell::{Cell, RefCell};
+    use lact_schema::config::{FanControlSettings, FanCurve, NvidiaCurvePoint};
+    use std::{
+        cell::{Cell, RefCell},
+        collections::VecDeque,
+        rc::Rc,
+        time::Duration,
+    };
+    use tokio::sync::Notify;
 
     const OFFSET_RANGE: (i32, i32) = (-1000, 1000);
 
@@ -2681,6 +2759,82 @@ mod tests {
         device.current = LimitRead::Unsupported;
         apply_power_cap(&mut device, None).unwrap();
         assert!(device.sets.is_empty());
+    }
+
+    /// Reads scripted temperatures, `None` being a failed read, and stops the
+    /// loop it drives once they run out.
+    struct FakeFanDevice {
+        temperatures: RefCell<VecDeque<Option<u32>>>,
+        stop: Rc<Notify>,
+        speeds: Vec<u32>,
+        released: Vec<u32>,
+    }
+
+    impl FakeFanDevice {
+        fn new(temperatures: &[Option<u32>]) -> Self {
+            Self {
+                temperatures: RefCell::new(temperatures.iter().copied().collect()),
+                stop: Rc::new(Notify::new()),
+                speeds: Vec::new(),
+                released: Vec::new(),
+            }
+        }
+
+        /// Runs a two-fan curve until it stops by itself or is stopped.
+        async fn run(&mut self) {
+            let settings = FanControlSettings {
+                interval_ms: 1,
+                ..Default::default()
+            };
+            let stop = self.stop.clone();
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                run_fan_curve(self, 2, &FanCurve::default(), &settings, &stop),
+            )
+            .await
+            .expect("the fan curve loop did not end");
+        }
+    }
+
+    impl FanDevice for FakeFanDevice {
+        fn gpu_temperature(&self) -> Result<u32, NvmlError> {
+            match self.temperatures.borrow_mut().pop_front() {
+                Some(Some(temperature)) => Ok(temperature),
+                Some(None) => Err(NvmlError::Unknown),
+                None => {
+                    self.stop.notify_one();
+                    Err(NvmlError::Unknown)
+                }
+            }
+        }
+
+        fn set_fan_percent(&mut self, fan: u32, _percent: u32) -> Result<(), NvmlError> {
+            self.speeds.push(fan);
+            Ok(())
+        }
+
+        fn release_fan(&mut self, fan: u32) -> Result<(), NvmlError> {
+            self.released.push(fan);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn unreadable_temperature_hands_the_fans_back_to_the_driver() {
+        // Fewer failures than the limit would keep the loop running.
+        let mut device = FakeFanDevice::new(&[Some(60), None, None, None, Some(70)]);
+        device.run().await;
+        assert_eq!(device.speeds, [0, 1]);
+        assert_eq!(device.released, [0, 1]);
+        assert_eq!(device.temperatures.borrow().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn occasional_unreadable_temperatures_keep_the_curve_running() {
+        let mut device = FakeFanDevice::new(&[None, None, Some(60), None, None, Some(70)]);
+        device.run().await;
+        assert_eq!(device.speeds, [0, 1, 0, 1]);
+        assert!(device.released.is_empty());
     }
 
     #[derive(Clone, Copy)]
