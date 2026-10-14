@@ -406,7 +406,10 @@ configuration is unchanged. Voltage boost and target-temperature failures are
 logged as warnings instead of failing the Apply, and the next Apply retries them.
 This includes restoring the default target temperature after removing a
 configured one: the target read at startup, or just before LACT first changed
-it if it was unreadable then.
+it if it was unreadable then. Restoring the default power limit after removing a
+configured cap fails the Apply instead when NVML cannot read or set the limits,
+like a configured cap does, so it stays pending for the next Apply; a GPU
+without power limit control has nothing to restore.
 
 Switching profiles also applies NVIDIA settings incrementally when the GPU is
 present in the destination profile. It does not first apply defaults and release
