@@ -3046,8 +3046,9 @@ mod runtime_config_reconciliation_tests {
             .await;
     }
 
-    /// A GPU that left the bus fails its reset; the GPUs after it are still
-    /// cleaned up, on reload as on shutdown, which then exits.
+    /// A GPU whose reset fails, as an NVIDIA GPU that left the bus now does
+    /// instead of panicking, does not keep the GPUs after it from being cleaned
+    /// up, on reload as on shutdown, which then returns so the daemon can exit.
     #[tokio::test]
     async fn reload_and_shutdown_clean_up_the_gpus_after_a_lost_one() {
         tokio::task::LocalSet::new()
