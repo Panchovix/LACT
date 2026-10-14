@@ -539,6 +539,23 @@ mod tests {
     }
 
     #[test]
+    fn failed_power_cap_restore_is_retried_and_revertible() {
+        let original = configured();
+        let mut state = AppliedState::default();
+        state.complete(&original);
+        let mut removed = original.clone();
+        removed.power_cap = None;
+        assert_eq!(groups(state.plan(&removed)), [Group::PowerCap]);
+        // The restore failed, so the Apply never completed.
+        state.attempted(Group::PowerCap);
+        assert_eq!(groups(state.plan(&removed)), [Group::PowerCap]);
+        assert_eq!(groups(state.plan(&original)), [Group::PowerCap]);
+        assert_eq!(state.last_successful.as_ref(), Some(&original));
+        state.complete(&removed);
+        assert!(groups(state.plan(&removed)).is_empty());
+    }
+
+    #[test]
     fn frequency_compensation_preserves_fresh_msvdd_demands_in_sparse_domains() {
         let states = [
             (1, 120000, 25000),
