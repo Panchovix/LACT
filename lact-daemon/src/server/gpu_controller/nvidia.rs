@@ -222,15 +222,15 @@ impl NvidiaGpuController {
     /// that only this GPU's operations fail instead of the whole daemon.
     fn device(&self) -> anyhow::Result<Device<'_>> {
         let result = lookup_device(&self.nvml, &self.common.pci_slot_name);
-        match &result {
-            Err(err) if !self.device_lost.replace(true) => error!("{err:#}"),
-            Ok(_) if self.device_lost.replace(false) => {
+        if lookup_state_changed(&self.device_lost, result.is_ok()) {
+            if let Err(err) = &result {
+                error!("{err:#}");
+            } else {
                 info!(
                     "NVIDIA GPU {} is accessible again",
                     self.common.pci_slot_name
                 );
             }
-            _ => (),
         }
         result
     }
@@ -316,11 +316,8 @@ impl NvidiaGpuController {
             .try_borrow_mut()
             .map_err(|err| anyhow!("Lock error: {err}"))?
             .take();
-        // A failed task must still hand its fans back below.
-        let mut task_error = None;
-        if let Some((notify, handle)) = maybe_notify {
-            notify.notify_one();
-            task_error = handle.await.err();
+        if let Some(task) = maybe_notify {
+            stop_fan_task(task).await;
             fail_on_error = true;
         }
 
@@ -338,19 +335,13 @@ impl NvidiaGpuController {
             }
         }
 
-        match task_error {
-            Some(err) => Err(anyhow!(err).context("Fan control task failed")),
-            None => Ok(()),
-        }
+        Ok(())
     }
 
-    /// Whether the curve fan control loop ended without being stopped, after
-    /// handing the fans back to the driver.
+    /// Whether the curve fan control loop ended without being stopped, for
+    /// example after handing the fans back to the driver.
     fn fan_curve_stopped_itself(&self) -> bool {
-        self.fan_control_handle.try_borrow().is_ok_and(|task| {
-            task.as_ref()
-                .is_some_and(|(_, handle)| handle.is_finished())
-        })
+        fan_task_finished(&self.fan_control_handle)
     }
 
     /// Stops the fan loop and hands every fan back to the driver without touching
@@ -1049,6 +1040,31 @@ fn configured_fan_stats(gpu_config: Option<&GpuConfig>) -> FanStats {
         auto_threshold: fan_settings.and_then(|settings| settings.auto_threshold),
         ..Default::default()
     }
+}
+
+/// Records whether the last lookup found the GPU, returning whether that
+/// changed, so a lost GPU is logged once rather than on every poll.
+fn lookup_state_changed(lost: &Cell<bool>, found: bool) -> bool {
+    lost.replace(!found) == found
+}
+
+/// Stops a curve fan control task. Its own failure is only logged: the caller
+/// hands the fans back either way, and failing here would fail every later
+/// Apply on this GPU.
+async fn stop_fan_task((notify, handle): FanControlHandle) {
+    notify.notify_one();
+    if let Err(err) = handle.await {
+        error!("fan control task failed: {err}");
+    }
+}
+
+/// Whether the curve fan control task ended on its own. The stopping paths
+/// take the task out first, so a finished task left in place stopped itself.
+fn fan_task_finished(task: &RefCell<Option<FanControlHandle>>) -> bool {
+    task.try_borrow().is_ok_and(|task| {
+        task.as_ref()
+            .is_some_and(|(_, handle)| handle.is_finished())
+    })
 }
 
 /// NVML reports a GPU that left the bus, for example after Xid 79, as lost or
@@ -2576,9 +2592,10 @@ mod tests {
     use super::{
         CLOCK_CLIENT_CLK_VF_POINT_TYPE_PROG, ClockClientClkVfPointInfoV1,
         ClockClientClkVfPointsControlV1, ClockClientClkVfPointsInfoV1,
-        ClockClientClkVfPointsStatusV3, FanDevice, NvmlError, PowerLimit, TargetTemperature,
-        TemperatureThreshold, apply_power_cap, apply_target_temperature, build_curve_control,
-        build_vf_curve, run_fan_curve,
+        ClockClientClkVfPointsStatusV3, FanControlHandle, FanDevice, NvmlError, PowerLimit,
+        TargetTemperature, TemperatureThreshold, apply_power_cap, apply_target_temperature,
+        build_curve_control, build_vf_curve, fan_task_finished, lookup_state_changed,
+        run_fan_curve, stop_fan_task,
     };
     use anyhow::Context;
     use indexmap::IndexMap;
@@ -2827,6 +2844,63 @@ mod tests {
         assert_eq!(device.speeds, [0, 1]);
         assert_eq!(device.released, [0, 1]);
         assert_eq!(device.temperatures.borrow().len(), 1);
+    }
+
+    #[test]
+    fn a_lost_gpu_is_logged_once_and_its_return_once() {
+        let lost = Cell::new(false);
+        let logged: Vec<_> = [false, false, true, true, false]
+            .into_iter()
+            .map(|found| lookup_state_changed(&lost, found))
+            .collect();
+        assert_eq!(logged, [true, false, true, false, true]);
+    }
+
+    /// A fan task doing `work` until it is stopped.
+    fn fan_task(work: impl Future<Output = ()> + 'static) -> RefCell<Option<FanControlHandle>> {
+        let notify = Rc::new(Notify::new());
+        let stop = notify.clone();
+        let handle = tokio::task::spawn_local(async move {
+            tokio::select! {
+                () = work => (),
+                () = stop.notified() => (),
+            }
+        });
+        RefCell::new(Some((notify, handle)))
+    }
+
+    async fn wait_until_finished(task: &RefCell<Option<FanControlHandle>>) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !fan_task_finished(task) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the fan task did not finish");
+    }
+
+    #[tokio::test]
+    async fn a_fan_task_that_ended_or_failed_is_detected_and_stops_without_error() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let running = fan_task(std::future::pending());
+                tokio::task::yield_now().await;
+                assert!(!fan_task_finished(&running));
+                let (notify, handle) = running.take().unwrap();
+                stop_fan_task((notify, handle)).await;
+                assert!(!fan_task_finished(&running));
+
+                let ended = fan_task(async {});
+                wait_until_finished(&ended).await;
+                stop_fan_task(ended.take().unwrap()).await;
+
+                // A failed task must not fail the stop that hands its fans back.
+                let failed = fan_task(async { panic!("synthetic fan task failure") });
+                wait_until_finished(&failed).await;
+                stop_fan_task(failed.take().unwrap()).await;
+                assert!(!fan_task_finished(&failed));
+            })
+            .await;
     }
 
     #[tokio::test]
