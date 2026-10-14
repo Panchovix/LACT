@@ -475,6 +475,13 @@ reset clocks first, LACT skips the rest of the cleanup, which would release rail
 policies, but still stops the fan control loop and tries to hand the fans back.
 The next Apply writes the fan settings again.
 
+A curve fan control loop keeps the current fan speed when a temperature read
+fails. After three failed reads in a row it returns the fans to the driver and
+stops, and the next Apply starts it again. An NVIDIA GPU that leaves the bus,
+for example after Xid 79, makes only its own operations fail: LACT logs it once,
+keeps applying, reloading and cleaning up the other GPUs, and its stats show
+only the configured fan settings until it is accessible again.
+
 Providers advertising `capabilities.profile_transactions: 1` support a durable
 profile transaction. LACT stages rail policies with a checkpoint before applying
 the subsequent clock, fan and thermal changes, and commits after all groups
