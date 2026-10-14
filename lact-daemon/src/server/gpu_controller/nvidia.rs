@@ -28,8 +28,8 @@ use lact_schema::{
     DeviceFlag, DeviceInfo, DeviceStats, DeviceType, DrmInfo, DrmMemoryInfo, FanControlMode,
     FanStats, IntelDrmInfo, LinkInfo, NvidiaClockDomainOffset, NvidiaClockOffset, NvidiaClockRatio,
     NvidiaClocksTable, NvidiaDomainVfCurve, NvidiaDomainVfPoint, NvidiaThermalInfo, NvidiaVfPoint,
-    NvidiaVoltageBoost, PmfwInfo, PowerState, PowerStates, PowerStats, ProcessInfo, ProcessList,
-    ProcessType, ProcessUtilizationType, TemperatureEntry, VoltageStats, VramStats,
+    NvidiaVoltageBoost, PowerState, PowerStates, PowerStats, ProcessInfo, ProcessList, ProcessType,
+    ProcessUtilizationType, TemperatureEntry, VoltageStats, VramStats,
     config::{FanControlSettings, FanCurve, GpuConfig, NvidiaCurvePoint},
 };
 use nvapi::NvApi;
@@ -51,7 +51,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{select, sync::Notify, time::sleep};
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 const SUPPORTED_UTIL_TYPES: &[ProcessUtilizationType] = &[
     ProcessUtilizationType::Graphics,
@@ -82,6 +82,9 @@ const XBAR_RATIO_RANGE: RangeInclusive<i32> = 50..=200;
 pub struct NvidiaGpuController {
     nvml: Rc<Nvml>,
     common: CommonControllerInfo,
+    /// Whether the last lookup failed, so that a GPU that left the bus is
+    /// logged once rather than on every poll.
+    device_lost: Cell<bool>,
     fan_control_handle: RefCell<Option<FanControlHandle>>,
     /// The target temperature before the first one set here, read at startup
     /// or, when unreadable then, just before that first change.
@@ -191,6 +194,7 @@ impl NvidiaGpuController {
             nvml,
             nvapi: nvapi.zip(nvapi_handle),
             common,
+            device_lost: Cell::new(false),
             driver_handle,
             nvapi_thermals_info,
             initial_target_temp: Cell::new(target_temp),
@@ -214,10 +218,21 @@ impl NvidiaGpuController {
         })
     }
 
-    fn device(&self) -> Device<'_> {
-        self.nvml
-            .device_by_pci_bus_id(self.common.pci_slot_name.as_str())
-            .expect("Can no longer get device")
+    /// Fails once the GPU has left the bus or is otherwise inaccessible, so
+    /// that only this GPU's operations fail instead of the whole daemon.
+    fn device(&self) -> anyhow::Result<Device<'_>> {
+        let result = lookup_device(&self.nvml, &self.common.pci_slot_name);
+        match &result {
+            Err(err) if !self.device_lost.replace(true) => error!("{err:#}"),
+            Ok(_) if self.device_lost.replace(false) => {
+                info!(
+                    "NVIDIA GPU {} is accessible again",
+                    self.common.pci_slot_name
+                );
+            }
+            _ => (),
+        }
+        result
     }
 
     fn get_nvidia_thermal_info(&self) -> NvidiaThermalInfo {
@@ -228,7 +243,7 @@ impl NvidiaGpuController {
     }
 
     fn get_target_temp(&self) -> Option<FanInfo> {
-        let device = self.device();
+        let device = self.device().ok()?;
         let current = device
             .temperature_threshold(TemperatureThreshold::AcousticCurr)
             .ok()?;
@@ -253,7 +268,7 @@ impl NvidiaGpuController {
         // Stop existing task to re-apply new curve
         self.stop_fan_control().await?;
 
-        let device = self.device();
+        let device = self.device()?;
         device
             .temperature(TemperatureSensor::Gpu)
             .context("Could not read temperature")?;
@@ -391,7 +406,7 @@ impl NvidiaGpuController {
             fail_on_error = true;
         }
 
-        let mut device = self.device();
+        let mut device = self.device()?;
         let fan_count = device.num_fans().context("Could not get fan count")?;
         for i in 0..fan_count {
             if let Err(err) = device
@@ -451,7 +466,7 @@ impl NvidiaGpuController {
     }
 
     fn try_get_power_states(&self) -> anyhow::Result<PowerStates> {
-        let device = self.device();
+        let device = self.device()?;
 
         let supported_states = device
             .supported_performance_states()
@@ -518,7 +533,7 @@ impl NvidiaGpuController {
         debug!("applying curve with {} points", curve.len());
 
         let offset_info = self
-            .device()
+            .device()?
             .clock_offset(Clock::Graphics, PerformanceState::Zero)
             .context("Could not get offset info")?;
 
@@ -955,6 +970,28 @@ fn average_fan_value<E>(
     (count > 0).then(|| sum / count)
 }
 
+/// The fan control settings part of a GPU's stats, without any readings.
+fn configured_fan_stats(gpu_config: Option<&GpuConfig>) -> FanStats {
+    let fan_settings = gpu_config.and_then(|config| config.fan_control_settings.as_ref());
+    FanStats {
+        control_enabled: gpu_config.is_some_and(|config| config.fan_control_enabled),
+        control_mode: fan_settings.map(|settings| settings.mode),
+        static_speed: fan_settings.map(|settings| settings.static_speed),
+        curve: fan_settings.map(|settings| settings.curve.0.clone()),
+        spindown_delay_ms: fan_settings.and_then(|settings| settings.spindown_delay_ms),
+        change_threshold: fan_settings.and_then(|settings| settings.change_threshold),
+        auto_threshold: fan_settings.and_then(|settings| settings.auto_threshold),
+        ..Default::default()
+    }
+}
+
+/// NVML reports a GPU that left the bus, for example after Xid 79, as lost or
+/// not found.
+fn lookup_device<'n>(nvml: &'n Nvml, pci_slot: &str) -> anyhow::Result<Device<'n>> {
+    nvml.device_by_pci_bus_id(pci_slot)
+        .with_context(|| format!("NVIDIA GPU {pci_slot} is not accessible through NVML"))
+}
+
 fn apply_power_mizer_mode(
     device: &mut Device<'_>,
     configured_mode: Option<PowerMizerMode>,
@@ -1127,7 +1164,7 @@ impl NvidiaGpuController {
         clippy::too_many_lines
     )]
     fn apply_clock_settings(&self, config: &GpuConfig) -> anyhow::Result<()> {
-        let mut device = self.device();
+        let mut device = self.device()?;
         let clocks = &config.clocks_configuration;
 
         match (clocks.min_core_clock, clocks.max_core_clock) {
@@ -1247,7 +1284,7 @@ impl NvidiaGpuController {
     }
 
     async fn apply_fan_settings(&self, config: &GpuConfig) -> anyhow::Result<()> {
-        let mut device = self.device();
+        let mut device = self.device()?;
         if config.fan_control_enabled {
             let settings = config
                 .fan_control_settings
@@ -1300,7 +1337,7 @@ impl NvidiaGpuController {
 
     fn apply_thermal_settings(&self, config: &GpuConfig) -> anyhow::Result<()> {
         apply_target_temperature(
-            &self.device(),
+            &self.device()?,
             config.nvidia_thermal_options.target_temperature,
             &self.initial_target_temp,
         )
@@ -1308,7 +1345,7 @@ impl NvidiaGpuController {
 
     #[allow(clippy::too_many_lines)]
     fn reset_frequency_basics(&self, discovery: bool) -> anyhow::Result<()> {
-        let mut device = self.device();
+        let mut device = self.device()?;
 
         let mut pstates = match device.supported_performance_states() {
             Ok(states) => states,
@@ -1573,7 +1610,7 @@ impl NvidiaGpuController {
     ) -> anyhow::Result<()> {
         match group {
             apply_plan::Group::PowerCap => {
-                let mut device = self.device();
+                let mut device = self.device()?;
                 if config.nvidia_power_cap_mode == lact_schema::config::NvidiaPowerCapMode::Ioctl {
                     driver::power_limit::apply(
                         self.driver_handle.as_ref(),
@@ -1586,7 +1623,7 @@ impl NvidiaGpuController {
                 }
             }
             apply_plan::Group::PowerMizer => {
-                apply_power_mizer_mode(&mut self.device(), config.power_mizer_mode)?;
+                apply_power_mizer_mode(&mut self.device()?, config.power_mizer_mode)?;
             }
             apply_plan::Group::Fans => self.apply_fan_settings(config).await?,
             apply_plan::Group::Thermal => {
@@ -1640,8 +1677,8 @@ impl GpuController for NvidiaGpuController {
 
     fn friendly_name(&self) -> Option<String> {
         self.device()
-            .name()
             .ok()
+            .and_then(|device| device.name().ok())
             .or_else(|| self.common.pci_info.device_pci_info.model.clone())
     }
 
@@ -1657,7 +1694,8 @@ impl GpuController for NvidiaGpuController {
                 DeviceApiInfo::default()
             };
 
-            let device = self.device();
+            // A GPU that left the bus still reports what does not need NVML.
+            let device = self.device().ok();
             let driver_handle = self.driver_handle.as_ref();
 
             DeviceInfo {
@@ -1678,36 +1716,41 @@ impl GpuController for NvidiaGpuController {
                     "nvidia {}",
                     self.nvml.sys_driver_version().unwrap_or_default()
                 ), // NVML should always be "nvidia"
-                vbios_version: device
-                    .vbios_version()
-                    .map_err(|err| error!("could not get VBIOS version: {err}"))
-                    .ok(),
-                link_info: LinkInfo {
-                    current_width: device.current_pcie_link_width().map(|v| v.to_string()).ok(),
-                    current_speed: device
-                        .pcie_link_speed()
-                        .map(|v| {
-                            let mut output = format!("{} GT/s", v / 1000);
-                            if let Ok(link_gen) = device.current_pcie_link_gen() {
-                                let _ = write!(output, " Gen {link_gen}");
-                            }
-                            output
-                        })
-                        .ok(),
-                    max_width: device.max_pcie_link_width().map(|v| v.to_string()).ok(),
-                    max_speed: device
-                        .max_pcie_link_speed()
+                vbios_version: device.as_ref().and_then(|device| {
+                    device
+                        .vbios_version()
+                        .map_err(|err| error!("could not get VBIOS version: {err}"))
                         .ok()
-                        .and_then(|v| v.as_integer())
-                        .map(|v| {
-                            let mut output = format!("{} GT/s", v / 1000);
-                            if let Ok(link_gen) = device.max_pcie_link_gen() {
-                                let _ = write!(output, " Gen {link_gen}");
-                            }
-                            output
-                        }),
-                },
-                drm_info: Some(DrmInfo {
+                }),
+                link_info: device
+                    .as_ref()
+                    .map(|device| LinkInfo {
+                        current_width: device.current_pcie_link_width().map(|v| v.to_string()).ok(),
+                        current_speed: device
+                            .pcie_link_speed()
+                            .map(|v| {
+                                let mut output = format!("{} GT/s", v / 1000);
+                                if let Ok(link_gen) = device.current_pcie_link_gen() {
+                                    let _ = write!(output, " Gen {link_gen}");
+                                }
+                                output
+                            })
+                            .ok(),
+                        max_width: device.max_pcie_link_width().map(|v| v.to_string()).ok(),
+                        max_speed: device
+                            .max_pcie_link_speed()
+                            .ok()
+                            .and_then(|v| v.as_integer())
+                            .map(|v| {
+                                let mut output = format!("{} GT/s", v / 1000);
+                                if let Ok(link_gen) = device.max_pcie_link_gen() {
+                                    let _ = write!(output, " Gen {link_gen}");
+                                }
+                                output
+                            }),
+                    })
+                    .unwrap_or_default(),
+                drm_info: device.as_ref().map(|device| DrmInfo {
                     device_name: device.name().ok(),
                     pci_revision_id: None,
                     family_name: device.architecture().map(|arch| arch.to_string()).ok(),
@@ -1764,7 +1807,13 @@ impl GpuController for NvidiaGpuController {
         clippy::too_many_lines
     )]
     fn get_stats(&self, gpu_config: Option<&GpuConfig>) -> DeviceStats {
-        let device = self.device();
+        let Ok(device) = self.device() else {
+            // A GPU that left the bus has no readings, only its configuration.
+            return DeviceStats {
+                fan: configured_fan_stats(gpu_config),
+                ..Default::default()
+            };
+        };
 
         let mut temps = IndexMap::new();
 
@@ -1889,8 +1938,6 @@ impl GpuController for NvidiaGpuController {
             }
         }
 
-        let fan_settings = gpu_config.and_then(|config| config.fan_control_settings.as_ref());
-
         let num_fans = device.num_fans().unwrap_or(0);
 
         let (pwm_current, speed_current) = if num_fans == 0 {
@@ -1933,22 +1980,11 @@ impl GpuController for NvidiaGpuController {
         DeviceStats {
             temps,
             fan: FanStats {
-                control_enabled: gpu_config.is_some_and(|config| config.fan_control_enabled),
-                control_mode: fan_settings.map(|settings| settings.mode),
-                static_speed: fan_settings.map(|settings| settings.static_speed),
-                curve: fan_settings.map(|settings| settings.curve.0.clone()),
-                spindown_delay_ms: fan_settings.and_then(|settings| settings.spindown_delay_ms),
-                change_threshold: fan_settings.and_then(|settings| settings.change_threshold),
-                auto_threshold: fan_settings.and_then(|settings| settings.auto_threshold),
-                temperature_key: None,
                 speed_current,
-                speed_max: None,
-                speed_min: None,
                 pwm_current,
                 pwm_max: fan_range.map(|(_, max)| (f64::from(max) * 2.55).round() as u32),
                 pwm_min: fan_range.map(|(min, _)| (f64::from(min) * 2.55).round() as u32),
-                temperature_range: None,
-                pmfw_info: PmfwInfo::default(),
+                ..configured_fan_stats(gpu_config)
             },
             nvidia_thermal_info: self.get_nvidia_thermal_info(),
             active_power_mizer_mode: power_mizer_info.as_ref().map(|info| info.current),
@@ -2010,7 +2046,7 @@ impl GpuController for NvidiaGpuController {
 
     #[allow(clippy::cast_possible_wrap)]
     fn get_clocks_info(&self, _gpu_config: Option<&GpuConfig>) -> anyhow::Result<ClocksInfo> {
-        let device = self.device();
+        let device = self.device()?;
 
         let mut gpu_offsets = IndexMap::new();
         let mut mem_offsets = IndexMap::new();
@@ -2357,7 +2393,7 @@ impl GpuController for NvidiaGpuController {
             }
         }
 
-        let device = self.device();
+        let device = self.device()?;
 
         let mut processes = BTreeMap::new();
 
