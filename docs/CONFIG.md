@@ -480,7 +480,9 @@ fails. After three failed reads in a row it returns the fans to the driver and
 stops, and the next Apply starts it again. An NVIDIA GPU that leaves the bus,
 for example after Xid 79, makes only its own operations fail: LACT logs it once,
 keeps applying, reloading and cleaning up the other GPUs, and its stats show
-only the configured fan settings until it is accessible again.
+only the configured fan settings until it is accessible again. After a GPU
+reload, a GPU that NVML cannot reach is detected as a generic device without
+NVIDIA controls.
 
 Providers advertising `capabilities.profile_transactions: 1` support a durable
 profile transaction. LACT stages rail policies with a checkpoint before applying
