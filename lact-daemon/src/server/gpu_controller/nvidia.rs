@@ -961,11 +961,7 @@ fn apply_power_mizer_mode(
 ) -> anyhow::Result<()> {
     let mode_info = match device.power_mizer_mode() {
         Ok(info) => info,
-        Err(
-            NvmlError::NotSupported
-            | NvmlError::FunctionNotFound
-            | NvmlError::FailedToLoadSymbol(_),
-        ) if configured_mode.is_none() => return Ok(()),
+        Err(err) if configured_mode.is_none() && nvml_unsupported(&err) => return Ok(()),
         Err(err) => return Err(err).context("Could not get PowerMizer mode"),
     };
     let mode = configured_mode.unwrap_or(PowerMizerMode::Auto);
@@ -1005,31 +1001,65 @@ fn supported_power_mizer_modes(modes: PowerMizerModes) -> Vec<PowerMizerMode> {
     .collect()
 }
 
+/// The NVML power limit of a GPU, in milliwatts.
+trait PowerLimit {
+    fn current_limit(&self) -> Result<u32, NvmlError>;
+    fn default_limit(&self) -> Result<u32, NvmlError>;
+    fn set_limit(&mut self, limit_mw: u32) -> Result<(), NvmlError>;
+}
+
+impl PowerLimit for Device<'_> {
+    fn current_limit(&self) -> Result<u32, NvmlError> {
+        self.power_management_limit()
+    }
+
+    fn default_limit(&self) -> Result<u32, NvmlError> {
+        self.power_management_limit_default()
+    }
+
+    fn set_limit(&mut self, limit_mw: u32) -> Result<(), NvmlError> {
+        self.set_power_management_limit(limit_mw)
+    }
+}
+
+/// Whether the GPU or driver lacks the control NVML was asked about.
+fn nvml_unsupported(error: &NvmlError) -> bool {
+    matches!(
+        error,
+        NvmlError::NotSupported | NvmlError::FunctionNotFound | NvmlError::FailedToLoadSymbol(_)
+    )
+}
+
+/// Sets the configured cap or, without one, restores the default limit. A
+/// restore that cannot read or write the limits fails, so the group stays
+/// pending for the next Apply; a GPU without power limit control has nothing
+/// to restore.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn apply_power_cap(device: &mut Device<'_>, power_cap: Option<f64>) -> anyhow::Result<()> {
-    if let Some(cap) = power_cap {
-        let cap = (cap * 1000.0) as u32;
+fn apply_power_cap(device: &mut impl PowerLimit, power_cap: Option<f64>) -> anyhow::Result<()> {
+    let target = match power_cap {
+        Some(cap) => (cap * 1000.0) as u32,
+        None => match device.default_limit() {
+            Ok(default) => default,
+            Err(err) if nvml_unsupported(&err) => return Ok(()),
+            Err(err) => return Err(err).context("Could not get default power cap"),
+        },
+    };
+    let current = match device.current_limit() {
+        Ok(current) => current,
+        Err(err) if power_cap.is_none() && nvml_unsupported(&err) => return Ok(()),
+        Err(err) => return Err(err).context("Could not get current cap"),
+    };
 
-        let current_cap = device
-            .power_management_limit()
-            .context("Could not get current cap")?;
-
-        if current_cap != cap {
-            debug!("setting power cap to {cap}");
+    if current != target {
+        if power_cap.is_some() {
+            debug!("setting power cap to {target}");
             device
-                .set_power_management_limit(cap)
+                .set_limit(target)
                 .context("Could not set power cap")?;
-        }
-    } else {
-        let current_cap = device.power_management_limit();
-        let default_cap = device.power_management_limit_default();
-
-        if let (Ok(current_cap), Ok(default_cap)) = (current_cap, default_cap)
-            && current_cap != default_cap
-        {
-            debug!("resetting power cap to {default_cap}");
+        } else {
+            debug!("resetting power cap to {target}");
             device
-                .set_power_management_limit(default_cap)
+                .set_limit(target)
                 .context("Could not reset power cap")?;
         }
     }
@@ -2438,8 +2468,9 @@ mod tests {
     use super::{
         CLOCK_CLIENT_CLK_VF_POINT_TYPE_PROG, ClockClientClkVfPointInfoV1,
         ClockClientClkVfPointsControlV1, ClockClientClkVfPointsInfoV1,
-        ClockClientClkVfPointsStatusV3, TargetTemperature, TemperatureThreshold,
-        apply_target_temperature, build_curve_control, build_vf_curve,
+        ClockClientClkVfPointsStatusV3, NvmlError, PowerLimit, TargetTemperature,
+        TemperatureThreshold, apply_power_cap, apply_target_temperature, build_curve_control,
+        build_vf_curve,
     };
     use anyhow::Context;
     use indexmap::IndexMap;
@@ -2509,6 +2540,111 @@ mod tests {
         assert_eq!(default.get(), Some(83));
         apply_target_temperature(&device, None, &default).unwrap();
         assert_eq!(*device.sets.borrow(), [70, 83]);
+    }
+
+    #[derive(Clone, Copy)]
+    enum LimitRead {
+        Value(u32),
+        Unsupported,
+        Lost,
+    }
+
+    /// Power limits of a fake GPU; `set_fails` makes every write fail.
+    struct FakePowerLimit {
+        current: LimitRead,
+        default: LimitRead,
+        set_fails: bool,
+        sets: Vec<u32>,
+    }
+
+    impl FakePowerLimit {
+        fn new(current: u32, default: u32) -> Self {
+            Self {
+                current: LimitRead::Value(current),
+                default: LimitRead::Value(default),
+                set_fails: false,
+                sets: Vec::new(),
+            }
+        }
+    }
+
+    fn read_limit(read: LimitRead) -> Result<u32, NvmlError> {
+        match read {
+            LimitRead::Value(value) => Ok(value),
+            LimitRead::Unsupported => Err(NvmlError::NotSupported),
+            LimitRead::Lost => Err(NvmlError::GpuLost),
+        }
+    }
+
+    impl PowerLimit for FakePowerLimit {
+        fn current_limit(&self) -> Result<u32, NvmlError> {
+            read_limit(self.current)
+        }
+
+        fn default_limit(&self) -> Result<u32, NvmlError> {
+            read_limit(self.default)
+        }
+
+        fn set_limit(&mut self, limit_mw: u32) -> Result<(), NvmlError> {
+            if self.set_fails {
+                return Err(NvmlError::Unknown);
+            }
+            self.sets.push(limit_mw);
+            self.current = LimitRead::Value(limit_mw);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn configured_power_cap_is_written_only_when_it_differs() {
+        let mut device = FakePowerLimit::new(300_000, 300_000);
+        apply_power_cap(&mut device, Some(250.0)).unwrap();
+        apply_power_cap(&mut device, Some(250.0)).unwrap();
+        assert_eq!(device.sets, [250_000]);
+        // A configured cap must be applied, even without power limit control.
+        for current in [LimitRead::Lost, LimitRead::Unsupported] {
+            device.current = current;
+            assert!(apply_power_cap(&mut device, Some(200.0)).is_err());
+        }
+        assert_eq!(device.sets, [250_000]);
+    }
+
+    #[test]
+    fn removed_power_cap_stays_pending_until_the_default_is_restored() {
+        let mut device = FakePowerLimit::new(250_000, 300_000);
+        device.default = LimitRead::Lost;
+        let error = apply_power_cap(&mut device, None).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("default power cap"),
+            "{error:#}"
+        );
+        device.default = LimitRead::Value(300_000);
+        device.current = LimitRead::Lost;
+        assert!(apply_power_cap(&mut device, None).is_err());
+        device.current = LimitRead::Value(250_000);
+        device.set_fails = true;
+        let error = apply_power_cap(&mut device, None).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("reset power cap"),
+            "{error:#}"
+        );
+        assert!(device.sets.is_empty());
+        // The retry restores the default once everything works again.
+        device.set_fails = false;
+        apply_power_cap(&mut device, None).unwrap();
+        apply_power_cap(&mut device, None).unwrap();
+        assert_eq!(device.sets, [300_000]);
+    }
+
+    #[test]
+    fn removed_power_cap_needs_nothing_without_power_limit_control() {
+        let mut device = FakePowerLimit::new(250_000, 300_000);
+        device.default = LimitRead::Unsupported;
+        apply_power_cap(&mut device, None).unwrap();
+        device.default = LimitRead::Value(300_000);
+        device.current = LimitRead::Unsupported;
+        apply_power_cap(&mut device, None).unwrap();
+        assert!(device.sets.is_empty());
     }
 
     #[derive(Clone, Copy)]
