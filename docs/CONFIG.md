@@ -480,9 +480,30 @@ fails. After three failed reads in a row it returns the fans to the driver and
 stops, and the next Apply starts it again. An NVIDIA GPU that leaves the bus,
 for example after Xid 79, makes only its own operations fail: LACT logs it once,
 keeps applying, reloading and cleaning up the other GPUs, and its stats show
-only the configured fan settings until it is accessible again. After a GPU
-reload, a GPU that NVML cannot reach is detected as a generic device without
-NVIDIA controls.
+only the configured fan settings until it is accessible again. If NVIDIA
+controller initialization fails, LACT reports the error and omits that device
+from its list instead of exposing unrelated generic controls. A later reload
+can initialize it again once the driver is available.
+
+An enabled fan curve must contain at least one point. Invalid curves are
+rejected before applying any of that GPU's settings, including when loaded
+from a profile or configuration file. If an empty curve nevertheless reaches
+the fan loop, its defensive result requests maximum fan speed instead of
+panicking.
+
+A panic during GPU discovery or reload leaves the reload event loop running,
+but disables further GPU queries and configuration changes until LACT is
+restarted manually. No later event automatically retries the interrupted
+operation. Configuration and recovery records are retained. If the panic
+occurred after controller cleanup or application began, LACT only attempts to
+return fan control to the driver; it does not continue resetting clocks or
+rail policies. Shutdown in this state also limits cleanup to fan control.
+
+Profile renaming shares the configuration reservation used by Apply and
+confirmation. It is rejected while settings are unconfirmed, while the profile
+is held, or while a hold needs its original name for restoration. Renaming an
+active profile otherwise preserves its settings, hooks and position without
+reapplying GPU settings.
 
 Providers advertising `capabilities.profile_transactions: 1` support a durable
 profile transaction. LACT stages rail policies with a checkpoint before applying
