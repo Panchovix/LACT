@@ -310,7 +310,7 @@ pub(crate) fn init_controller(
     // SAFETY: We use global LazyLock to make sure it's safe.
     // Loading of shared libaries is unsafe
     // https://docs.rs/libloading/0.8.8/libloading/struct.Library.html#method.new
-    let _guard = INIT_MUTEX.lock().unwrap();
+    let _guard = lock_initialization(&INIT_MUTEX)?;
 
     #[cfg(feature = "nvidia")]
     #[allow(unused_unsafe)]
@@ -379,22 +379,17 @@ pub(crate) fn init_controller(
         }
         #[cfg(feature = "nvidia")]
         "nvidia" => {
-            if let Some(nvml) = nvml.clone() {
-                match NvidiaGpuController::new(
+            // A failed NVIDIA controller must never become an AMD controller:
+            // that would hide initialization failure behind unrelated controls.
+            return initialize_nvidia(nvml.clone(), |nvml| {
+                NvidiaGpuController::new(
                     common.clone(),
                     nvml,
                     nvapi.clone(),
                     config.daemon.nvidia_runtime.clone(),
-                ) {
-                    Ok(controller) => {
-                        return Ok(Box::new(controller));
-                    }
-                    Err(err) => error!("could not initialize Nvidia controller: {err:#}"),
-                }
-            } else {
-                #[cfg(not(test))]
-                error!("NVML is missing, Nvidia controls will not be available");
-            }
+                )
+                .map(|controller| Box::new(controller) as DynGpuController)
+            });
         }
         _ => {
             warn!(
@@ -411,6 +406,21 @@ pub(crate) fn init_controller(
         AmdGpuController::new_from_path(common, None)
             .context("Could initialize fallback controller")?,
     ))
+}
+
+fn lock_initialization(mutex: &Mutex<()>) -> anyhow::Result<std::sync::MutexGuard<'_, ()>> {
+    mutex.lock().map_err(|_| anyhow!(
+        "GPU initialization previously panicked; restart LACT manually before initializing controllers"
+    ))
+}
+
+#[cfg(feature = "nvidia")]
+fn initialize_nvidia<N, T>(
+    nvml: Option<N>,
+    initialize: impl FnOnce(N) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let nvml = nvml.context("NVIDIA controls unavailable: NVML could not be initialized")?;
+    initialize(nvml).context("NVIDIA controls unavailable: controller initialization failed")
 }
 
 fn parse_uevent(data: &str) -> HashMap<&str, &str> {
@@ -447,4 +457,42 @@ pub fn read_mock_snapshot(
     let snapshot = serde_json::from_str(&raw_snapshot).expect("could not parse snapshot");
 
     Some(snapshot)
+}
+
+#[cfg(test)]
+mod initialization_failure_tests {
+    use super::*;
+
+    #[cfg(feature = "nvidia")]
+    #[test]
+    fn nvidia_missing_nvml_never_initializes_another_controller() {
+        let error = initialize_nvidia(None::<()>, |()| -> anyhow::Result<()> {
+            panic!("no controller may be constructed without NVML")
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("NVML"));
+    }
+
+    #[cfg(feature = "nvidia")]
+    #[test]
+    fn nvidia_initialization_error_is_preserved() {
+        let error = initialize_nvidia(Some(()), |()| -> anyhow::Result<()> {
+            anyhow::bail!("synthetic NVIDIA initialization failure")
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("NVIDIA controls unavailable"));
+        assert!(format!("{error:#}").contains("synthetic NVIDIA initialization failure"));
+        assert_eq!(initialize_nvidia(Some(7), Ok).unwrap(), 7);
+    }
+
+    #[test]
+    fn poisoned_initialization_lock_returns_actionable_error() {
+        let mutex = Mutex::new(());
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = mutex.lock().unwrap();
+            panic!("synthetic initialization panic");
+        });
+        let error = lock_initialization(&mutex).unwrap_err();
+        assert!(error.to_string().contains("restart LACT manually"));
+    }
 }

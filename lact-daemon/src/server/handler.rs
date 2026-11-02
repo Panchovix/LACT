@@ -23,6 +23,7 @@ use amdgpu_sysfs::gpu_handle::{
     PerformanceLevel, PowerLevelKind, power_profile_mode::PowerProfileModesTable,
 };
 use anyhow::{Context, anyhow, bail};
+use futures::FutureExt;
 use lact_schema::{
     ClocksInfo, DeviceApiInfo, DeviceInfo, DeviceListEntry, DeviceStats, DisplaysInfo,
     FanControlMode, FanOptions, GpuPciInfo, PmfwOptions, PowerStates, ProcessList, ProfileRule,
@@ -46,6 +47,7 @@ use std::{
     fs::{self, File, Permissions},
     io::{BufWriter, Cursor, Write},
     os::unix::fs::{MetadataExt, PermissionsExt},
+    panic::AssertUnwindSafe,
     path::{Path, PathBuf},
     rc::Rc,
     sync::{Arc, LazyLock},
@@ -115,6 +117,7 @@ pub struct Handler {
     gpu_controllers: Rc<RwLock<BTreeMap<String, DynGpuController>>>,
     confirm_config_tx: Rc<RefCell<Option<oneshot::Sender<ConfirmCommand>>>>,
     config_operation: Arc<Mutex<()>>,
+    reload_failed: Rc<Cell<bool>>,
     pub config_last_saved: Rc<Cell<Instant>>,
     profile_watcher_tx: Rc<RefCell<Option<mpsc::Sender<ProfileWatcherCommand>>>>,
     pub profile_watcher_state: Rc<RefCell<Option<ProfileWatcherState>>>,
@@ -213,6 +216,7 @@ impl<'a> Handler {
             config: Rc::new(RwLock::new(config)),
             confirm_config_tx: Rc::new(RefCell::new(None)),
             config_operation: Arc::new(Mutex::new(())),
+            reload_failed: Rc::new(Cell::new(false)),
             config_last_saved: Rc::new(Cell::new(Instant::now())),
             profile_watcher_tx: Rc::new(RefCell::new(None)),
             profile_watcher_state: Rc::new(RefCell::new(None)),
@@ -255,7 +259,16 @@ impl<'a> Handler {
         self.apply_current_config_inner().await
     }
 
+    fn ensure_controllers_available(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.reload_failed.get(),
+            "GPU reload panicked; hardware state may be incomplete. Restart LACT manually before accessing GPU controls"
+        );
+        Ok(())
+    }
+
     fn try_config_operation(&self) -> anyhow::Result<OwnedMutexGuard<()>> {
+        self.ensure_controllers_available()?;
         self.config_operation.clone().try_lock_owned().map_err(|_| {
             anyhow!(
                 "There is a configuration operation or unconfirmed configuration change pending"
@@ -264,6 +277,7 @@ impl<'a> Handler {
     }
 
     async fn apply_current_config_inner(&self) -> anyhow::Result<()> {
+        self.ensure_controllers_available()?;
         let config = self.config.read().await;
         let controllers = self.gpu_controllers.read().await;
         apply_config_to_controllers(&controllers, &config).await
@@ -275,6 +289,7 @@ impl<'a> Handler {
             Ok(operation) => (operation, false),
             Err(_) => (self.config_operation.clone().lock_owned().await, true),
         };
+        self.ensure_controllers_available()?;
         {
             let mut config = self.config.write().await;
             *config = new_config;
@@ -303,46 +318,79 @@ impl<'a> Handler {
     }
 
     async fn reload_gpus_from(&self, base_path: &Path) {
+        self.reload_gpus_with(|config, detached_ids| {
+            let pci_db = read_pci_db();
+            load_controllers(base_path, &pci_db, detached_ids, config)
+        })
+        .await;
+    }
+
+    // The caller reserves config_operation. Injecting discovery also lets tests
+    // exercise reload failures without enumerating sysfs or initializing drivers.
+    async fn reload_gpus_with(
+        &self,
+        discover: impl FnOnce(&Config, &[String]) -> anyhow::Result<BTreeMap<String, DynGpuController>>,
+    ) {
+        if let Err(err) = self.ensure_controllers_available() {
+            error!("skipping GPU reload: {err:#}");
+            return;
+        }
         let mut controllers_guard = self.gpu_controllers.write().await;
         let config = self.config.read().await;
         let detached_ids = self.ignored_gpu_ids.read().await;
 
-        let pci_db = read_pci_db();
-        match load_controllers(base_path, &pci_db, &detached_ids, &config) {
-            Ok(new_controllers) => {
-                info!(
-                    "GPU list reloaded with {} devices, reapplying configuration",
-                    new_controllers.len()
-                );
-
-                for (id, old_controller) in controllers_guard.iter() {
-                    if let Err(err) = old_controller.prepare_reset().await {
-                        error!("could not recover controller before reload: {err:#}");
-                        release_fan_control(id, old_controller.as_ref()).await;
-                        continue;
-                    }
-                    if let Err(err) = old_controller.reset_clocks() {
-                        error!("could not reset clocks before controller cleanup: {err:#}");
-                        release_fan_control(id, old_controller.as_ref()).await;
-                        continue;
-                    }
-                    old_controller.cleanup().await;
-                }
-
-                *controllers_guard = new_controllers;
-
-                match apply_config_to_controllers(&controllers_guard, &config).await {
-                    Ok(()) => {
-                        info!("configuration applied");
-                    }
-                    Err(err) => {
-                        error!("could not reapply config: {err:#}");
-                    }
-                }
-            }
-            Err(err) => {
+        // Ordinary discovery errors leave the old map intact. A panic may also
+        // poison global driver/library state, so only ordinary errors are retryable.
+        let discovered =
+            std::panic::catch_unwind(AssertUnwindSafe(|| discover(&config, &detached_ids)));
+        let new_controllers = match discovered {
+            Ok(Ok(controllers)) => controllers,
+            Ok(Err(err)) => {
                 error!("could not load GPU controllers: {err:#}");
+                return;
             }
+            Err(_) => {
+                self.reload_failed.set(true);
+                error!(
+                    "GPU discovery panicked; keeping existing controllers and ownership untouched. GPU access disabled until LACT is restarted manually"
+                );
+                return;
+            }
+        };
+        info!(
+            "GPU list reloaded with {} devices, reapplying configuration",
+            new_controllers.len()
+        );
+
+        let result = AssertUnwindSafe(async {
+            for (id, old_controller) in controllers_guard.iter() {
+                if let Err(err) = old_controller.prepare_reset().await {
+                    error!("could not recover controller before reload: {err:#}");
+                    release_fan_control(id, old_controller.as_ref()).await;
+                    continue;
+                }
+                if let Err(err) = old_controller.reset_clocks() {
+                    error!("could not reset clocks before controller cleanup: {err:#}");
+                    release_fan_control(id, old_controller.as_ref()).await;
+                    continue;
+                }
+                old_controller.cleanup().await;
+            }
+            *controllers_guard = new_controllers;
+            if let Err(err) = apply_config_to_controllers(&controllers_guard, &config).await {
+                error!("could not reapply config: {err:#}");
+            } else {
+                info!("configuration applied");
+            }
+        })
+        .catch_unwind()
+        .await;
+        if result.is_err() {
+            // Rust locks are released by unwinding, but device state and controller
+            // caches may already have changed. Never retry writes on that state.
+            self.reload_failed.set(true);
+            error!("GPU reload panicked; GPU access disabled until LACT is restarted manually");
+            release_all_fans(&controllers_guard).await;
         }
     }
 
@@ -357,6 +405,10 @@ impl<'a> Handler {
 
     pub async fn start_profile_watcher(&self) {
         let _operation = self.config_operation.clone().lock_owned().await;
+        if let Err(err) = self.ensure_controllers_available() {
+            error!("cannot start profile watcher: {err:#}");
+            return;
+        }
         self.start_profile_watcher_inner().await;
     }
 
@@ -557,7 +609,9 @@ impl<'a> Handler {
         &self,
         id: &str,
     ) -> anyhow::Result<RwLockReadGuard<'_, dyn GpuController>> {
+        self.ensure_controllers_available()?;
         let guard = self.gpu_controllers.read().await;
+        self.ensure_controllers_available()?;
         RwLockReadGuard::try_map(guard, |controllers| controllers.get(id).map(Box::as_ref))
             .map_err(|_| anyhow!("Controller '{id}' not found"))
     }
@@ -566,6 +620,9 @@ impl<'a> Handler {
         let mut entries = Vec::new();
 
         let controllers = self.gpu_controllers.read().await;
+        if self.reload_failed.get() {
+            return entries;
+        }
 
         for (id, controller) in controllers.iter() {
             entries.push(DeviceListEntry {
@@ -583,7 +640,9 @@ impl<'a> Handler {
         id: &str,
         include_api_info: Option<bool>,
     ) -> anyhow::Result<DeviceInfo> {
+        self.ensure_controllers_available()?;
         let controllers = self.gpu_controllers.read().await;
+        self.ensure_controllers_available()?;
         let controller = controllers
             .get(id)
             .ok_or_else(|| anyhow!("Controller '{id}' not found"))?;
@@ -595,7 +654,9 @@ impl<'a> Handler {
     }
 
     pub async fn get_device_api_info(&'a self, id: &str) -> anyhow::Result<DeviceApiInfo> {
+        self.ensure_controllers_available()?;
         let controllers = self.gpu_controllers.read().await;
+        self.ensure_controllers_available()?;
         let controller = controllers
             .get(id)
             .ok_or_else(|| anyhow!("Controller '{id}' not found"))?;
@@ -853,6 +914,9 @@ impl<'a> Handler {
     }
 
     pub async fn generate_snapshot(&self) -> anyhow::Result<String> {
+        self.ensure_controllers_available()?;
+        let controllers = self.gpu_controllers.read().await;
+        self.ensure_controllers_available()?;
         let datetime = jiff::Zoned::now().strftime("%Y%m%d-%H%M%S");
         let out_path = format!("/tmp/LACT-v{DAEMON_VERSION}-snapshot-{datetime}.tar.gz");
 
@@ -868,7 +932,6 @@ impl<'a> Handler {
             add_path_recursively(&mut archive, path, Path::new("/"))?;
         }
 
-        let controllers = self.gpu_controllers.read().await;
         for controller in controllers.values() {
             let controller_path = &controller.controller_info().sysfs_path;
 
@@ -925,7 +988,7 @@ impl<'a> Handler {
 
         let info = json!({
             "system_info": system_info,
-            "devices": self.generate_snapshot_device_info().await,
+            "devices": self.snapshot_device_info_from(&controllers).await,
         });
         let info_data = serde_json::to_vec_pretty(&info).unwrap();
 
@@ -963,10 +1026,21 @@ impl<'a> Handler {
         Ok(out_path)
     }
 
+    #[cfg(test)]
     pub(crate) async fn generate_snapshot_device_info(
         &self,
     ) -> BTreeMap<String, SnapshotDeviceInfo> {
         let controllers = self.gpu_controllers.read().await;
+        if self.reload_failed.get() {
+            return BTreeMap::new();
+        }
+        self.snapshot_device_info_from(&controllers).await
+    }
+
+    async fn snapshot_device_info_from(
+        &self,
+        controllers: &BTreeMap<String, DynGpuController>,
+    ) -> BTreeMap<String, SnapshotDeviceInfo> {
         let config = self.config.read().await;
 
         let mut map = BTreeMap::new();
@@ -974,7 +1048,7 @@ impl<'a> Handler {
         for (id, controller) in controllers.iter() {
             let gpu_config = config.gpus().ok().and_then(|gpus| gpus.get(id));
 
-            let unique_vendor = controller_vendor_is_unique(controller, id, &controllers);
+            let unique_vendor = controller_vendor_is_unique(controller, id, controllers);
 
             let data = SnapshotDeviceInfo {
                 pci_info: controller.controller_info().pci_info.clone(),
@@ -1424,6 +1498,7 @@ impl<'a> Handler {
 
     pub async fn release_profile(&self, cookie: u64) -> anyhow::Result<()> {
         let _operation = self.config_operation.clone().lock_owned().await;
+        self.ensure_controllers_available()?;
         let (idx, was_top) = {
             let holds = self.profile_holds.borrow();
             match holds.iter().rposition(|(c, _, _)| *c == cookie) {
@@ -1472,6 +1547,10 @@ impl<'a> Handler {
 
     pub async fn reset_config(&self) {
         let _operation = self.config_operation.clone().lock_owned().await;
+        if let Err(err) = self.ensure_controllers_available() {
+            error!("cannot reset configuration: {err:#}");
+            return;
+        }
         self.cleanup_inner().await;
 
         let mut config = self.config.write().await;
@@ -1488,6 +1567,11 @@ impl<'a> Handler {
     }
 
     async fn cleanup_inner(&self) {
+        if self.reload_failed.get() {
+            let controllers = self.gpu_controllers.read().await;
+            release_all_fans(&controllers).await;
+            return;
+        }
         self.cleanup_controllers(false).await;
     }
 
@@ -1872,6 +1956,20 @@ async fn release_fan_control(id: &str, controller: &dyn GpuController) {
     }
 }
 
+// A reload panic permits fan release only. Each attempt is isolated so a
+// faulty controller cannot prevent the remaining fans from being released.
+async fn release_all_fans(controllers: &BTreeMap<String, DynGpuController>) {
+    for (id, controller) in controllers {
+        if AssertUnwindSafe(release_fan_control(id, controller.as_ref()))
+            .catch_unwind()
+            .await
+            .is_err()
+        {
+            error!("fan release panicked for {id}; manual recovery may be required");
+        }
+    }
+}
+
 /// The hold is gone once released, so a failure after its profile switch is
 /// logged instead of being reported as a failed release.
 fn report_released_profile(
@@ -1924,7 +2022,15 @@ fn controller_vendor_is_unique(
     })
 }
 
-async fn handle_reload_events(handler: Handler, mut rx: mpsc::Receiver<Duration>) {
+async fn handle_reload_events(handler: Handler, rx: mpsc::Receiver<Duration>) {
+    handle_reload_events_with(rx, || handler.reload_gpus()).await;
+}
+
+async fn handle_reload_events_with<F, Fut>(mut rx: mpsc::Receiver<Duration>, mut reload: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
     // Reload events often come in quick succession (usually from DRM devices initializing),
     // this accumulation avoids unnecessarily reloading multiple times in such cases.
     while let Some(interval) = rx.recv().await {
@@ -1947,7 +2053,7 @@ async fn handle_reload_events(handler: Handler, mut rx: mpsc::Receiver<Duration>
         }
 
         info!("got reload event, reloading GPUs");
-        handler.reload_gpus().await;
+        reload().await;
     }
 }
 
@@ -2187,6 +2293,7 @@ mod runtime_config_reconciliation_tests {
             gpu_controllers: Rc::new(RwLock::new(controllers)),
             confirm_config_tx: Rc::new(RefCell::new(None)),
             config_operation: Arc::new(Mutex::new(())),
+            reload_failed: Rc::new(Cell::new(false)),
             config_last_saved: Rc::new(Cell::new(Instant::now())),
             profile_watcher_tx: Rc::default(),
             profile_watcher_state: Rc::default(),
@@ -2194,7 +2301,7 @@ mod runtime_config_reconciliation_tests {
             profile_holds: Rc::default(),
             profile_hold_snapshot: Rc::default(),
             next_hold_cookie: Rc::new(Cell::new(1)),
-            polkit_proxy: None,
+            polkit_wrapper: None,
             ignored_gpu_ids: Rc::new(RwLock::new(vec![])),
             reload_tx: Rc::new(mpsc::channel(1).0),
         }
@@ -3058,6 +3165,261 @@ mod runtime_config_reconciliation_tests {
         let previous_saved = handler.config_last_saved.get();
         handler.reload_config(Config::default()).await.unwrap();
         assert_eq!(handler.config_last_saved.get(), previous_saved);
+    }
+
+    /// Every query panics: these tests must only exercise injected reload work.
+    struct ReloadProbe {
+        calls: Rc<RefCell<Vec<&'static str>>>,
+        panic_in: &'static str,
+    }
+
+    impl ReloadProbe {
+        fn call(&self, operation: &'static str) {
+            self.calls.borrow_mut().push(operation);
+            assert_ne!(self.panic_in, operation, "synthetic reload panic");
+        }
+    }
+
+    impl GpuController for ReloadProbe {
+        fn controller_type(&self) -> &'static str {
+            "test"
+        }
+        fn controller_info(&self) -> &CommonControllerInfo {
+            unreachable!("unexpected metadata query")
+        }
+        fn device_type(&self) -> DeviceType {
+            unreachable!("unexpected device query")
+        }
+        fn friendly_name(&self) -> Option<String> {
+            unreachable!("unexpected name query")
+        }
+        fn get_info(&self, _: bool, _: bool) -> LocalBoxFuture<'_, DeviceInfo> {
+            unreachable!("unexpected info query")
+        }
+        fn get_stats(&self, _: Option<&GpuConfig>) -> DeviceStats {
+            unreachable!("unexpected stats query")
+        }
+        fn get_clocks_info(&self, _: Option<&GpuConfig>) -> anyhow::Result<ClocksInfo> {
+            unreachable!("unexpected clocks query")
+        }
+        fn get_power_states(&self, _: Option<&GpuConfig>) -> PowerStates {
+            unreachable!("unexpected power query")
+        }
+        fn get_power_profile_modes(&self) -> anyhow::Result<PowerProfileModesTable> {
+            unreachable!("unexpected modes query")
+        }
+        fn vbios_dump(&self) -> anyhow::Result<Vec<u8>> {
+            unreachable!("unexpected VBIOS query")
+        }
+        fn process_list(&self) -> anyhow::Result<ProcessList> {
+            unreachable!("unexpected process query")
+        }
+        fn prepare_reset(&self) -> LocalBoxFuture<'_, anyhow::Result<()>> {
+            async {
+                self.call("prepare");
+                Ok(())
+            }
+            .boxed_local()
+        }
+        fn reset_clocks(&self) -> anyhow::Result<()> {
+            self.call("reset");
+            Ok(())
+        }
+        fn cleanup(&self) -> LocalBoxFuture<'_, ()> {
+            async {
+                self.call("cleanup");
+            }
+            .boxed_local()
+        }
+        fn apply_config<'a>(&'a self, _: &'a GpuConfig) -> LocalBoxFuture<'a, anyhow::Result<()>> {
+            async {
+                self.call("apply");
+                Ok(())
+            }
+            .boxed_local()
+        }
+        fn release_fan_control(&self) -> LocalBoxFuture<'_, anyhow::Result<()>> {
+            async {
+                self.call("fans");
+                Ok(())
+            }
+            .boxed_local()
+        }
+    }
+
+    fn reload_probe(
+        calls: &Rc<RefCell<Vec<&'static str>>>,
+        panic_in: &'static str,
+    ) -> DynGpuController {
+        Box::new(ReloadProbe {
+            calls: calls.clone(),
+            panic_in,
+        })
+    }
+
+    #[tokio::test]
+    async fn discovery_panic_keeps_controllers_untouched_and_blocks_later_discovery() {
+        let calls = Rc::default();
+        let handler = handler_with(
+            Config::default(),
+            BTreeMap::from([("gpu".into(), reload_probe(&calls, ""))]),
+        );
+        let _operation = handler.config_operation.clone().lock_owned().await;
+        handler
+            .reload_gpus_with(|_, _| panic!("synthetic discovery panic"))
+            .await;
+        assert!(handler.reload_failed.get());
+        assert!(calls.borrow().is_empty());
+        assert_eq!(handler.gpu_controllers.read().await.len(), 1);
+        handler
+            .reload_gpus_with(|_, _| panic!("discovery must not be retried"))
+            .await;
+        assert!(calls.borrow().is_empty());
+        assert_eq!(handler.gpu_controllers.read().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ordinary_discovery_error_keeps_controllers_and_remains_retryable() {
+        let calls = Rc::default();
+        let handler = handler_with(
+            Config::default(),
+            BTreeMap::from([("gpu".into(), reload_probe(&calls, ""))]),
+        );
+        let _operation = handler.config_operation.clone().lock_owned().await;
+        handler
+            .reload_gpus_with(|_, _| anyhow::bail!("synthetic discovery error"))
+            .await;
+        assert!(!handler.reload_failed.get());
+        assert!(calls.borrow().is_empty());
+        assert_eq!(handler.gpu_controllers.read().await.len(), 1);
+        handler.reload_gpus_with(|_, _| Ok(BTreeMap::new())).await;
+        assert_eq!(*calls.borrow(), ["prepare", "reset", "cleanup"]);
+        assert!(handler.gpu_controllers.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn queued_gpu_queries_recheck_reload_failure_after_acquiring_controllers() {
+        let calls = Rc::default();
+        let handler = handler_with(
+            Config::default(),
+            BTreeMap::from([("gpu".into(), reload_probe(&calls, ""))]),
+        );
+        let controllers = handler.gpu_controllers.write().await;
+        let mut info = Box::pin(handler.get_device_info("gpu", Some(false)));
+        let mut stats = Box::pin(handler.get_gpu_stats("gpu"));
+        assert!(futures::poll!(info.as_mut()).is_pending());
+        assert!(futures::poll!(stats.as_mut()).is_pending());
+        handler.reload_failed.set(true);
+        drop(controllers);
+        assert!(info.await.is_err());
+        assert!(stats.await.is_err());
+        assert!(calls.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reload_apply_panic_blocks_mutations_and_queries_but_preserves_config_and_lock() {
+        let calls = Rc::default();
+        let mut config = Config::default();
+        config
+            .gpus_mut()
+            .unwrap()
+            .insert("gpu".into(), gpu_config(100.0));
+        let handler = handler_with(config.clone(), BTreeMap::new());
+        let operation = handler.config_operation.clone().lock_owned().await;
+        handler
+            .reload_gpus_with(|_, _| {
+                Ok(BTreeMap::from([(
+                    "gpu".into(),
+                    reload_probe(&calls, "apply"),
+                )]))
+            })
+            .await;
+        assert!(handler.reload_failed.get());
+        assert_eq!(*calls.borrow(), ["apply", "fans"]);
+        assert!(handler.config_operation.try_lock().is_err());
+        drop(operation);
+        assert!(handler.config_operation.try_lock().is_ok());
+        assert_eq!(*handler.config.read().await, config);
+        let error = handler
+            .set_gpu_config("gpu", gpu_config(200.0))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Restart LACT manually"));
+        assert!(handler.reload_config(Config::default()).await.is_err());
+        assert!(handler.release_profile(1).await.is_err());
+        handler.reset_config().await;
+        handler.start_profile_watcher().await;
+        assert!(handler.profile_watcher_tx.borrow().is_none());
+        assert_eq!(*handler.config.read().await, config);
+        assert!(handler.get_device_info("gpu", Some(false)).await.is_err());
+        assert!(handler.get_device_api_info("gpu").await.is_err());
+        assert!(handler.get_gpu_stats("gpu").await.is_err());
+        assert!(handler.get_clocks_info("gpu").await.is_err());
+        assert!(handler.list_devices().await.is_empty());
+        assert!(handler.generate_snapshot_device_info().await.is_empty());
+        assert!(handler.generate_snapshot().await.is_err());
+        assert_eq!(*calls.borrow(), ["apply", "fans"]);
+        handler.cleanup().await;
+        assert_eq!(*calls.borrow(), ["apply", "fans", "fans"]);
+    }
+
+    #[tokio::test]
+    async fn reload_loop_survives_cleanup_panic_without_touching_controllers_on_next_event() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let calls = Rc::default();
+                let handler = handler_with(
+                    Config::default(),
+                    BTreeMap::from([("gpu".into(), reload_probe(&calls, "cleanup"))]),
+                );
+                let discoveries = Rc::new(Cell::new(0));
+                let (tx, rx) = mpsc::channel(2);
+                let (completed_tx, mut completed_rx) = mpsc::unbounded_channel();
+                let loop_handler = handler.clone();
+                let loop_discoveries = discoveries.clone();
+                let task = tokio::task::spawn_local(handle_reload_events_with(rx, move || {
+                    let handler = loop_handler.clone();
+                    let discoveries = loop_discoveries.clone();
+                    let completed = completed_tx.clone();
+                    async move {
+                        let _operation = handler.config_operation.clone().lock_owned().await;
+                        handler
+                            .reload_gpus_with(|_, _| {
+                                discoveries.set(discoveries.get() + 1);
+                                Ok(BTreeMap::new())
+                            })
+                            .await;
+                        completed.send(()).unwrap();
+                    }
+                }));
+                tx.send(Duration::ZERO).await.unwrap();
+                completed_rx.recv().await.unwrap();
+                assert!(handler.reload_failed.get());
+                assert_eq!(*calls.borrow(), ["prepare", "reset", "cleanup", "fans"]);
+                tx.send(Duration::ZERO).await.unwrap();
+                completed_rx.recv().await.unwrap();
+                assert_eq!(discoveries.get(), 1);
+                assert_eq!(*calls.borrow(), ["prepare", "reset", "cleanup", "fans"]);
+                assert!(handler.config_operation.try_lock().is_ok());
+                drop(tx);
+                task.await.unwrap();
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn fan_only_cleanup_after_reload_panic_continues_past_another_panic() {
+        let calls = Rc::default();
+        let handler = handler_with(
+            Config::default(),
+            BTreeMap::from([
+                ("a".into(), reload_probe(&calls, "fans")),
+                ("b".into(), reload_probe(&calls, "")),
+            ]),
+        );
+        handler.reload_failed.set(true);
+        handler.cleanup().await;
+        assert_eq!(*calls.borrow(), ["fans", "fans"]);
     }
 
     /// Owns a background fan loop that only `cleanup` or `release_fan_control` stops.
