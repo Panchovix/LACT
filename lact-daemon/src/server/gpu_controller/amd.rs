@@ -1129,6 +1129,7 @@ impl GpuController for AmdGpuController {
     #[allow(clippy::too_many_lines)]
     fn apply_config<'a>(&'a self, config: &'a GpuConfig) -> LocalBoxFuture<'a, anyhow::Result<()>> {
         Box::pin(async {
+            super::common::fan_control::validate_fan_settings(config)?;
             let mut commit_handles = VecDeque::new();
             let is_core_clocks_used = config.is_core_clocks_used();
             let (reset_handle, performance_level_available) = self.prepare_clocks_table();

@@ -2229,6 +2229,7 @@ impl GpuController for NvidiaGpuController {
     #[allow(clippy::too_many_lines)]
     fn apply_config<'a>(&'a self, config: &'a GpuConfig) -> LocalBoxFuture<'a, anyhow::Result<()>> {
         Box::pin(async {
+            super::common::fan_control::validate_fan_settings(config)?;
             runtime_controls::validate_settings(config.nvidia_rail_controls.as_ref())?;
             let preparation = self.prepare_runtime_controls(config).await?;
             let mut rail_deferral = match &preparation.decision {

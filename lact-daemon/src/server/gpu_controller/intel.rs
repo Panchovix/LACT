@@ -775,6 +775,7 @@ impl GpuController for IntelGpuController {
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn apply_config<'a>(&'a self, config: &'a GpuConfig) -> LocalBoxFuture<'a, anyhow::Result<()>> {
         Box::pin(async {
+            super::common::fan_control::validate_fan_settings(config)?;
             if let Some(max_clock) = config.clocks_configuration.max_core_clock {
                 if self.read_freq(FrequencyType::Max).is_some() {
                     self.write_freq(FrequencyType::Max, max_clock)
