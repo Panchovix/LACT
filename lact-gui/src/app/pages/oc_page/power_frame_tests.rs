@@ -12,6 +12,19 @@ fn experimental_power_mode_is_explicit_and_restores_native_bounds() {
             context.iteration(false);
         }
     };
+    let wait_for = |ready: &dyn Fn() -> bool| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        context.block_on(async {
+            while !ready() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out waiting for factory output"
+                );
+                // FactoryHashMap forwards on Tokio; an empty GLib queue is not a barrier.
+                gtk::glib::timeout_future(std::time::Duration::from_millis(1)).await;
+            }
+        });
+    };
     // Stats also publishes PerformanceLevelChanged in the upstream component.
     let (output, _output_receiver) = relm4::channel::<OcPageMsg>();
     let frame = PowerFrame::launch_default().forward(&output, |msg| msg);
@@ -84,7 +97,12 @@ fn experimental_power_mode_is_explicit_and_restores_native_bounds() {
         .map_while(|index| list.row_at_index(index))
         .position(|row| row == frame.widgets().experimental_controls)
         .unwrap();
-    assert!((0..toggle).any(|index| list.row_at_index(index as i32).unwrap().is_visible()));
+    let cap_row = (0..)
+        .map_while(|index| list.row_at_index(index))
+        .find(|row| row.has_css_class("adjustment-row"))
+        .expect("the power cap SettingRow must be present");
+    assert!(cap_row.is_visible());
+    assert!(cap_row.index() < toggle as i32);
 
     // An explicit reset must clear a stale stored cap even if the UI is already default.
     frame.emit(PowerFrameMsg::Reset);
@@ -104,11 +122,20 @@ fn experimental_power_mode_is_explicit_and_restores_native_bounds() {
         frame.model().nvidia_power_cap_mode(),
         Some(NvidiaPowerCapMode::Ioctl)
     );
-    frame.model().rows.send(
-        &PowerSetting::PowerCap,
-        SettingRowMsg::SetValue(SettingRowValue::Numeric(150.0)),
-    );
-    drain();
+    {
+        let model = frame.model();
+        let row = model.rows.get(&PowerSetting::PowerCap).unwrap();
+        let SettingControl::Adjustment(control) = &row.control else {
+            panic!("the cap row must use an adjustment");
+        };
+        // A widget edit is visible immediately, before Changed has crossed both runtimes.
+        control.widgets().spinbutton.set_value(150.0);
+    }
+    assert!(!frame.model().power_cap_changed);
+    let immediate = frame.model().serialize();
+    assert_eq!(immediate.power_cap, Some(150.0));
+    assert!(immediate.power_cap_changed);
+    wait_for(&|| frame.model().power_cap_changed);
     let pending = frame.model().serialize();
     assert_eq!(pending.power_cap, Some(150.0));
     assert!(pending.power_cap_changed);
@@ -163,9 +190,17 @@ fn experimental_power_mode_is_explicit_and_restores_native_bounds() {
 
     // Other drivers never see the toggle or report a mode.
     frame.emit(PowerFrameMsg::NvidiaMode(None));
-    frame.emit(stats(native_stats));
+    frame.emit(stats(native_stats.clone()));
     drain();
     assert!(!frame.widgets().experimental_controls.is_visible());
     assert_eq!(frame.model().nvidia_power_cap_mode(), None);
     assert_eq!(cap_min(), 250.0);
+
+    // Missing bounds hide the cap control; they must not create a cap reset edit.
+    frame.emit(stats(PowerStats {
+        cap_max: None,
+        ..native_stats
+    }));
+    drain();
+    assert!(!frame.model().serialize().power_cap_changed);
 }

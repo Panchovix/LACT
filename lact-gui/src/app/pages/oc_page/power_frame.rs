@@ -277,6 +277,8 @@ impl relm4::Component for PowerFrame {
                 }
 
                 self.power = power.clone();
+                // Factory roots enter the list before init_widgets adds their CSS classes.
+                self.rows.widget().invalidate_sort();
                 self.performance_level_changed(&sender);
             }
             // Config arrives before the initial stats rebuild; it is not a user edit.
@@ -325,10 +327,18 @@ impl relm4::Component for PowerFrame {
                         .launch((table, self.performance_level()))
                         .forward(APP_BROKER.sender(), |()| AppMsg::SettingsChanged)
                 });
+                self.rows.widget().invalidate_sort();
             }
             PowerFrameMsg::SettingChanged(setting) => {
                 if setting == PowerSetting::PowerCap {
-                    self.power_cap_changed = true;
+                    let differs = self
+                        .power_cap_value()
+                        .is_some_and(|value| Some(value) != self.power.cap_current);
+                    if !differs && !self.power_cap_changed {
+                        return;
+                    }
+                    // Factory output may arrive after a configuration reload.
+                    self.power_cap_changed |= differs;
                 }
                 APP_BROKER.send(AppMsg::SettingsChanged);
                 if setting == PowerSetting::PerformanceLevel {
@@ -358,7 +368,11 @@ impl PowerFrame {
             .and_then(|power_profile_mode| power_profile_mode.model().serialize());
         PowerFrameSerialized {
             power_cap: value(PowerSetting::PowerCap).and_then(SettingRowValue::as_numeric),
-            power_cap_changed: self.power_cap_changed,
+            // A factory notification can still be in transit through Tokio at Apply time.
+            power_cap_changed: self.power_cap_changed
+                || self
+                    .power_cap_value()
+                    .is_some_and(|value| Some(value) != self.power.cap_current),
             nvidia_power_cap_mode: self.nvidia_power_cap_mode(),
             performance_level: selected(PowerSetting::PerformanceLevel)
                 .and_then(|index| PERFORMANCE_LEVELS.get(index as usize).copied()),
@@ -372,6 +386,13 @@ impl PowerFrame {
                 .map(|mode| mode.custom_heuristics)
                 .unwrap_or_default(),
         }
+    }
+
+    fn power_cap_value(&self) -> Option<f64> {
+        self.rows
+            .get(&PowerSetting::PowerCap)?
+            .get_value()
+            .as_numeric()
     }
 
     fn nvidia_mode_available(&self) -> bool {
