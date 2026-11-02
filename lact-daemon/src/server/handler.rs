@@ -1049,7 +1049,7 @@ impl<'a> Handler {
 
         let mut map = BTreeMap::new();
 
-        for (id, controller) in controllers.iter() {
+        for (id, controller) in controllers {
             let gpu_config = config.gpus().ok().and_then(|gpus| gpus.get(id));
 
             let unique_vendor = controller_vendor_is_unique(controller, id, controllers);
