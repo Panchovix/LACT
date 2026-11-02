@@ -1211,6 +1211,16 @@ impl<'a> Handler {
     }
 
     pub async fn rename_profile(&self, name: &str, new_name: String) -> anyhow::Result<()> {
+        let _operation = self.try_config_operation()?;
+        if self
+            .profile_hold_snapshot
+            .borrow()
+            .as_ref()
+            .and_then(|(profile, _)| profile.as_deref())
+            == Some(name)
+        {
+            bail!("Cannot rename profile '{name}' while a hold needs it for restoration");
+        }
         if self
             .profile_holds
             .borrow()
@@ -2434,6 +2444,102 @@ mod runtime_config_reconciliation_tests {
     }
 
     #[tokio::test]
+    async fn rename_reserves_before_waiting_for_configuration() {
+        let mut config = Config::default();
+        config.profiles.insert("old".into(), Profile::default());
+        let handler = handler_with(config, BTreeMap::new());
+        let write_guard = handler.config.write().await;
+        let saved = handler.config_last_saved.get();
+        let mut rename = Box::pin(handler.rename_profile("old", "new".into()));
+        assert!(futures::poll!(rename.as_mut()).is_pending());
+        assert!(handler.try_config_operation().is_err());
+        assert_eq!(handler.config_last_saved.get(), saved);
+        drop(write_guard);
+        rename.await.unwrap();
+        assert!(handler.try_config_operation().is_ok());
+        assert!(handler.config.read().await.profiles.contains_key("new"));
+    }
+
+    #[tokio::test]
+    async fn rename_preserves_active_profile_and_order_without_applying_it() {
+        let calls = Rc::default();
+        let mut config = Config::default();
+        let profile = Profile {
+            gpus: [("gpu".into(), gpu_config(150.0))].into(),
+            hooks: ProfileHooks {
+                activated: Some("exit 99".into()),
+                deactivated: Some("exit 98".into()),
+            },
+            ..Default::default()
+        };
+        config.profiles.insert("first".into(), Profile::default());
+        config.profiles.insert("old".into(), profile.clone());
+        config.profiles.insert("last".into(), Profile::default());
+        config.current_profile = Some("old".into());
+        let handler = handler_with(config, controllers(&calls, &[("gpu", false)]));
+        handler.rename_profile("old", "new".into()).await.unwrap();
+        let saved = handler.config.read().await;
+        assert_eq!(saved.current_profile.as_deref(), Some("new"));
+        assert_eq!(
+            saved
+                .profiles
+                .keys()
+                .map(AsRef::as_ref)
+                .collect::<Vec<&str>>(),
+            ["first", "new", "last"]
+        );
+        assert_eq!(saved.profiles["new"], profile);
+        assert!(calls.borrow().is_empty());
+        drop(saved);
+        let timestamp = handler.config_last_saved.get();
+        assert!(handler.rename_profile("new", "last".into()).await.is_err());
+        assert!(
+            handler
+                .rename_profile("missing", "unused".into())
+                .await
+                .is_err()
+        );
+        assert_eq!(handler.config_last_saved.get(), timestamp);
+    }
+
+    #[tokio::test]
+    async fn rename_keeps_the_restore_profile_valid_during_nested_holds() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let mut config = Config::default();
+                for name in ["original", "first", "second"] {
+                    config.profiles.insert(name.into(), Profile::default());
+                }
+                config.current_profile = Some("original".into());
+                let handler = handler_with(config, BTreeMap::new());
+                let first = handler
+                    .hold_profile("first".into(), Arc::new(tokio::sync::Notify::new()))
+                    .await
+                    .unwrap();
+                let second = handler
+                    .hold_profile("second".into(), Arc::new(tokio::sync::Notify::new()))
+                    .await
+                    .unwrap();
+                for name in ["original", "first", "second"] {
+                    assert!(
+                        handler
+                            .rename_profile(name, "renamed".into())
+                            .await
+                            .is_err()
+                    );
+                }
+                handler.release_profile(second).await.unwrap();
+                handler.release_profile(first).await.unwrap();
+                assert_eq!(
+                    handler.config.read().await.current_profile.as_deref(),
+                    Some("original")
+                );
+                assert!(handler.profile_hold_snapshot.borrow().is_none());
+            })
+            .await;
+    }
+
+    #[tokio::test]
     async fn edit_reserves_before_first_await_and_rejects_parallel_rpc() {
         tokio::task::LocalSet::new()
             .run_until(async {
@@ -2494,6 +2600,14 @@ mod runtime_config_reconciliation_tests {
                     .await
                     .unwrap();
                 assert_eq!(starts.recv().await.unwrap(), Some(200.0));
+                let saved = handler.config_last_saved.get();
+                assert!(
+                    handler
+                        .rename_profile("other", "renamed".into())
+                        .await
+                        .is_err()
+                );
+                assert_eq!(handler.config_last_saved.get(), saved);
                 handler
                     .confirm_pending_config(ConfirmCommand::Revert)
                     .unwrap();
@@ -2512,6 +2626,12 @@ mod runtime_config_reconciliation_tests {
                         .is_err()
                 );
                 assert!(handler.delete_profile("other".into()).await.is_err());
+                assert!(
+                    handler
+                        .rename_profile("other", "renamed".into())
+                        .await
+                        .is_err()
+                );
                 assert!(handler.detach_gpu("gpu").await.is_err());
                 assert!(handler.reset_pmfw("gpu").await.is_err());
                 assert!(handler.config.read().await.current_profile.is_none());
