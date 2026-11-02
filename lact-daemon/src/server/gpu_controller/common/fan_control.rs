@@ -1,6 +1,9 @@
 use amdgpu_sysfs::{gpu_handle::fan_control::FanCurve as PmfwCurve, hw_mon::Temperature};
 use anyhow::{Context, anyhow, bail};
-use lact_schema::config::FanCurve;
+use lact_schema::{
+    FanControlMode,
+    config::{FanCurve, GpuConfig},
+};
 use tracing::warn;
 
 pub trait FanCurveExt {
@@ -37,7 +40,10 @@ impl FanCurveExt for FanCurve {
             }
             (Some((_, lower_speed)), None) => *lower_speed,
             (None, Some((_, higher_speed))) => *higher_speed,
-            (None, None) => panic!("Could not find fan speed on the curve! This is a bug."),
+            (None, None) => {
+                warn!("Fan curve has no points; requesting maximum fan speed");
+                return u8::MAX;
+            }
         };
 
         (f32::from(u8::MAX) * percentage) as u8
@@ -84,6 +90,9 @@ impl FanCurveExt for FanCurve {
     }
 
     fn validate(&self) -> anyhow::Result<()> {
+        if self.0.is_empty() {
+            bail!("Fan curve must contain at least one point");
+        }
         for percentage in self.0.values() {
             if !(0.0..=1.0).contains(percentage) {
                 return Err(anyhow!("Fan speed percentage must be between 0 and 1"));
@@ -93,12 +102,30 @@ impl FanCurveExt for FanCurve {
     }
 }
 
+/// Validate requested curve control before a controller changes any settings.
+pub(crate) fn validate_fan_settings(config: &GpuConfig) -> anyhow::Result<()> {
+    if config.fan_control_enabled {
+        let settings = config
+            .fan_control_settings
+            .as_ref()
+            .context("Fan control is enabled but its settings are missing")?;
+        if settings.mode == FanControlMode::Curve {
+            settings.curve.validate()?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{FanCurve, PmfwCurve};
+    use super::{FanCurve, PmfwCurve, validate_fan_settings};
     use crate::server::gpu_controller::common::fan_control::FanCurveExt;
     use amdgpu_sysfs::{gpu_handle::fan_control::FanCurveRanges, hw_mon::Temperature};
     use anyhow::anyhow;
+    use lact_schema::{
+        FanControlMode,
+        config::{FanControlSettings, GpuConfig},
+    };
 
     fn simple_pwm(temp: f32) -> u8 {
         let curve = FanCurve([(0, 0.0), (100, 1.0)].into());
@@ -108,6 +135,49 @@ mod tests {
             crit_hyst: Some(-100.0),
         };
         curve.pwm_at_temp(temp)
+    }
+
+    #[test]
+    fn empty_curve_is_rejected_and_cannot_panic_the_control_loop() {
+        let curve = FanCurve(Default::default());
+        assert!(
+            curve
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("at least one point")
+        );
+        assert_eq!(
+            curve.pwm_at_temp(Temperature {
+                current: Some(60.0),
+                crit: None,
+                crit_hyst: None,
+            }),
+            u8::MAX
+        );
+    }
+
+    #[test]
+    fn only_active_curve_control_requires_curve_points() {
+        let mut config = GpuConfig {
+            fan_control_enabled: true,
+            fan_control_settings: Some(FanControlSettings {
+                mode: FanControlMode::Curve,
+                curve: FanCurve(Default::default()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(validate_fan_settings(&config).is_err());
+        config.fan_control_settings.as_mut().unwrap().curve = FanCurve([(50, 0.5)].into());
+        validate_fan_settings(&config).unwrap();
+        config.fan_control_settings.as_mut().unwrap().curve = FanCurve(Default::default());
+        config.fan_control_settings.as_mut().unwrap().mode = FanControlMode::Static;
+        validate_fan_settings(&config).unwrap();
+        config.fan_control_settings = None;
+        assert!(validate_fan_settings(&config).is_err());
+        config.fan_control_enabled = false;
+        validate_fan_settings(&config).unwrap();
     }
 
     #[test]
