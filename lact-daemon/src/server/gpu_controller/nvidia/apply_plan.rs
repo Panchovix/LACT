@@ -218,11 +218,13 @@ impl AppliedState {
         for group in deferred {
             match group {
                 Group::Rails => {
-                    applied.nvidia_rail_controls = previous.nvidia_rail_controls.clone()
+                    applied
+                        .nvidia_rail_controls
+                        .clone_from(&previous.nvidia_rail_controls);
                 }
                 Group::Boost => {
                     applied.clocks_configuration.voltage_boost =
-                        previous.clocks_configuration.voltage_boost
+                        previous.clocks_configuration.voltage_boost;
                 }
                 Group::Thermal => applied.nvidia_thermal_options = previous.nvidia_thermal_options,
                 _ => (),

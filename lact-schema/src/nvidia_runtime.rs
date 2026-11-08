@@ -27,6 +27,10 @@ pub struct NvidiaRuntimeDevice {
 
 #[skip_serializing_none]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "These are independent fields in the runtime wire protocol"
+)]
 pub struct NvidiaRuntimeInfo {
     pub protocol_version: u32,
     pub available: bool,
@@ -132,10 +136,18 @@ pub enum NvidiaRailOperation {
     Restore,
 }
 
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "Serde skip_serializing_if passes the field by reference"
+)]
 fn is_zero(value: &u32) -> bool {
     *value == 0
 }
 
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "Serde skip_serializing_if passes the field by reference"
+)]
 fn is_false(value: &bool) -> bool {
     !value
 }

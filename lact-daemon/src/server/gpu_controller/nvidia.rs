@@ -1395,7 +1395,7 @@ impl NvidiaGpuController {
                         .context("Could not get fan speed range")?;
 
                     for point in settings.curve.0.values() {
-                        #[allow(clippy::cast_possible_truncation)]
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                         if !(min_speed..=max_speed).contains(&((*point * 100.0) as u32)) {
                             bail!(
                                 "Fan speed {}% outside of the allowed range {min_speed}% to {max_speed}%",
@@ -2293,10 +2293,9 @@ impl GpuController for NvidiaGpuController {
                                     }
                                 }
                                 apply_plan::Group::Clocks => {
-                                    if transaction
-                                        .as_ref()
-                                        .is_some_and(|transaction| transaction.is_staged())
-                                    {
+                                    if transaction.as_ref().is_some_and(
+                                        runtime_controls::RuntimeTransaction::is_staged,
+                                    ) {
                                         // Persist before the first frequency SET, including a partial failure.
                                         self.frequency_recovery_needed.set(true);
                                     }

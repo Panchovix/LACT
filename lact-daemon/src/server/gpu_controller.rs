@@ -65,7 +65,9 @@ pub fn partially_applied(error: anyhow::Error) -> anyhow::Error {
 }
 
 pub fn is_partially_applied(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| cause.is::<PartiallyApplied>())
+    error
+        .chain()
+        .any(<dyn std::error::Error>::is::<PartiallyApplied>)
 }
 
 pub trait GpuController {

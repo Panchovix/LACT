@@ -3,7 +3,7 @@ use crate::config::NvidiaRuntimeHelperConfig;
 use anyhow::{Context, anyhow, bail, ensure};
 use lact_schema::{
     NvidiaDeferredRailField, NvidiaRail, NvidiaRailControls, NvidiaRailField, NvidiaRailOperation,
-    NvidiaRuntimeDevice, NvidiaRuntimeInfo,
+    NvidiaRuntimeCapabilities, NvidiaRuntimeDevice, NvidiaRuntimeInfo,
 };
 use serde::Serialize;
 use std::{
@@ -82,7 +82,9 @@ pub(super) fn is_unavailable(error: &anyhow::Error) -> bool {
     error
         .chain()
         .any(|cause| cause.is::<HelperUnavailable>() || cause.is::<RailDeferral>())
-        && !error.chain().any(|cause| cause.is::<RecoveryReported>())
+        && !error
+            .chain()
+            .any(<dyn std::error::Error>::is::<RecoveryReported>)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -441,7 +443,7 @@ impl Action {
 }
 
 #[derive(Serialize)]
-struct Request<'a> {
+struct WireRequest<'a> {
     protocol_version: u32,
     action: Action,
     device: &'a NvidiaRuntimeDevice,
@@ -553,7 +555,7 @@ impl RuntimeControls {
                 deferred_fields: vec![],
                 ownership_unavailable: false,
                 rails_pending: false,
-                capabilities: Default::default(),
+                capabilities: NvidiaRuntimeCapabilities::default(),
                 transaction_id: None,
                 transaction_status: None,
                 request_id: None,
@@ -1357,9 +1359,15 @@ fn validate_token(value: &str) -> anyhow::Result<()> {
 }
 
 fn new_request_id() -> anyhow::Result<String> {
+    use std::fmt::Write as _;
+
     let mut bytes = [0u8; 32];
     fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
-    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+    let mut request_id = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(request_id, "{byte:02x}")?;
+    }
+    Ok(request_id)
 }
 
 /// The owned request of one helper process.
@@ -1381,7 +1389,7 @@ async fn invoke_process(
     // Nothing can write native state before a helper process exists.
     let prepare = || {
         let executable = checked_executable(&config.executable)?;
-        let payload = serde_json::to_vec(&Request {
+        let payload = serde_json::to_vec(&WireRequest {
             protocol_version: PROTOCOL_VERSION,
             action: request.action,
             device: &device,
@@ -1493,7 +1501,10 @@ async fn invoke_process(
                 return (Err(error), Some(child));
             }
             // A typed refusal means the helper ran and judged its own state.
-            if error.chain().any(|cause| cause.is::<HelperRefused>()) {
+            if error
+                .chain()
+                .any(<dyn std::error::Error>::is::<HelperRefused>)
+            {
                 (Err(error), None)
             } else {
                 (Err(unavailable(error)), None)
